@@ -1,0 +1,248 @@
+
+
+
+
+# import logging
+# from bot.matrix_client import matrix_client
+# from bot.dsl_validator import safe_send_dsl
+# from db import get_menu_items
+# from agent.tools import MENU_PRICES
+
+# logger = logging.getLogger(__name__)
+
+
+# async def send_menu(room_id: str):
+#     # Fetch menu from Supabase
+#     items = await get_menu_items()
+
+#     if not items:
+#         logger.warning("⚠️ No menu items found in database")
+#         await matrix_client.room_send(
+#             room_id,
+#             message_type="m.room.message",
+#             content={
+#                 "msgtype": "m.text",
+#                 "body": "Sorry, menu is not available right now!",
+#             },
+#         )
+#         return
+
+#     # Update MENU_PRICES so agent knows prices for orders
+#     MENU_PRICES.clear()
+#     MENU_PRICES.update({
+#         item["name"].lower(): int(item["price"])
+#         for item in items
+#     })
+
+#     # Build DSL payload
+#     dsl = {
+#         "v": 1,
+#         "type": "menu",
+#         "data": {
+#             "title": "Our Menu",
+#             "items": [
+#                 {
+#                     "id": str(item["id"]),
+#                     "name": item["name"],
+#                     "price": item["price"],
+#                     "image": item.get("image", ""),
+#                 }
+#                 for item in items
+#             ],
+#         },
+#     }
+
+#     # Validate against schema before sending
+#     if not safe_send_dsl(dsl):
+#         logger.error("❌ Menu DSL invalid, not sending")
+#         return
+
+#     await matrix_client.room_send(
+#         room_id,
+#         message_type="m.room.message",
+#         content={
+#             "msgtype": "m.text",
+#             "body": "Menu",
+#             "ai.jaeno.dsl": dsl,
+#         },
+#     )
+#     logger.info(f"📋 Menu sent with {len(items)} items from SQLite")
+
+
+import json
+import logging
+from bot.matrix_client import matrix_client
+from bot.dsl_validator import safe_send_dsl
+from db import get_menu_items
+from agent.state import MENU_PRICES
+
+logger = logging.getLogger(__name__)
+
+
+async def send_menu(room_id: str):
+    items = await get_menu_items()
+
+    if not items:
+        logger.warning("⚠️ No menu items found in database")
+        await matrix_client.room_send(
+            room_id,
+            message_type="m.room.message",
+            content={"msgtype": "m.text", "body": "Sorry, menu is not available right now!"},
+        )
+        return
+
+    MENU_PRICES.clear()
+    MENU_PRICES.update({
+        item["name"].lower(): int(item["price"])
+        for item in items
+    })
+
+    from db import get_ordering_enabled, get_all_item_orderable
+    ordering_enabled = get_ordering_enabled()
+    item_flags = get_all_item_orderable()  # {item_name_lower: bool} — only disabled/explicit rows
+
+    categories_map = {}
+    for item in items:
+        cat = item.get("category") or "Other"
+        categories_map.setdefault(cat, []).append(item)
+
+    dsl = {
+        "v": 2,
+        "type": "menu",
+        "data": {
+            "title": "Our Menu",
+            "orderable": ordering_enabled,
+            "categories": [
+                {
+                    "name": cat_name,
+                    "items": [
+                        {
+                            "id": str(i["id"]),
+                            "name": i["name"],
+                            "price": i["price"],
+                            "image": i.get("image") or "",
+                            "orderable": item_flags.get(i["name"].lower().strip(), True),
+                        }
+                        for i in cat_items
+                    ],
+                }
+                for cat_name, cat_items in categories_map.items()
+            ],
+        },
+    }
+
+    logger.info(f"📤 DSL payload: {json.dumps(dsl)}")
+
+    if not safe_send_dsl(dsl):
+        logger.error("❌ Menu DSL invalid, not sending")
+        return
+
+    await matrix_client.room_send(
+        room_id,
+        message_type="m.room.message",
+        content={"msgtype": "m.text", "body": "Menu", "ai.jaeno.dsl": dsl},
+    )
+    logger.info(f"📋 Menu sent — {len(items)} items across {len(categories_map)} categories")
+    
+    
+    
+async def send_item_card(room_id: str, item_name: str):
+    items = await get_menu_items()
+
+    target = next(
+        (i for i in items if i["name"].lower() == item_name.strip().lower()),
+        None,
+    )
+    if not target:
+        target = next(
+            (i for i in items if item_name.strip().lower() in i["name"].lower()),
+            None,
+        )
+
+    if not target:
+        await matrix_client.room_send(
+            room_id,
+            message_type="m.room.message",
+            content={"msgtype": "m.text", "body": f"Sorry, couldn't find '{item_name}' on the menu!"},
+        )
+        return
+
+    dsl = {
+        "v": 1,
+        "type": "menu_item",
+        "data": {
+            "name": target["name"],
+            "price": str(target["price"]),
+            "image": target.get("image") or "",
+            "description": target.get("description") or "",
+        },
+    }
+
+    if not safe_send_dsl(dsl):
+        logger.error("❌ menu_item DSL invalid, not sending")
+        return
+
+    await matrix_client.room_send(
+        room_id,
+        message_type="m.room.message",
+        content={
+            "msgtype": "m.text",
+            "body": target["name"],
+            "ai.jaeno.dsl": dsl,
+        },
+    )
+    logger.info(f"📋 Item card sent: {target['name']}")
+    
+    
+    
+    
+
+    
+async def send_category_card(room_id: str, category_name: str):
+    items = await get_menu_items()
+
+    matched = [
+        i for i in items
+        if (i.get("category") or "").lower() == category_name.strip().lower()
+    ]
+    if not matched:
+        matched = [
+            i for i in items
+            if category_name.strip().lower() in (i.get("category") or "").lower()
+        ]
+
+    if not matched:
+        await matrix_client.room_send(
+            room_id,
+            message_type="m.room.message",
+            content={"msgtype": "m.text", "body": f"Sorry, couldn't find a '{category_name}' category!"},
+        )
+        return
+
+    dsl = {
+        "v": 1,
+        "type": "menu_category",
+        "data": {
+            "name": matched[0]["category"],
+            "items": [
+                {
+                    "id": str(i["id"]),
+                    "name": i["name"],
+                    "price": i["price"],
+                    "image": i.get("image") or "",
+                }
+                for i in matched
+            ],
+        },
+    }
+
+    if not safe_send_dsl(dsl):
+        logger.error("❌ menu_category DSL invalid, not sending")
+        return
+
+    await matrix_client.room_send(
+        room_id,
+        message_type="m.room.message",
+        content={"msgtype": "m.text", "body": matched[0]["category"], "ai.jaeno.dsl": dsl},
+    )
+    logger.info(f"📋 Category card sent: {matched[0]['category']} ({len(matched)} items)")    
