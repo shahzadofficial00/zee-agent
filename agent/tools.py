@@ -3,7 +3,7 @@ import concurrent.futures
 import re
 import logging
 from langchain_core.tools import tool
-from agent.state import MENU_PRICES, CACHED_MENU
+from agent.state import MENU_PRICES, CACHED_MENU, is_menu_cache_fresh, update_menu_cache
 from db import save_order, save_reservation
 
 logger = logging.getLogger(__name__)
@@ -31,26 +31,27 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
             name_only = re.sub(r'\s*[xX]\s*\d+$', '', item_str).strip()
             if not get_item_orderable(name_only):
                 return f"ITEM_NOT_ORDERABLE: {name_only} is not available for ordering right now. Apologize and ask the customer to pick something else."
-        # ── Load fresh prices from DB (don't rely on MENU_PRICES being warm) ──
-        from db import get_menu_items
-
-        prices = {}
-
-        def load_prices():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                menu = loop.run_until_complete(get_menu_items())
-                return {i["name"].lower(): int(i["price"]) for i in menu}
-            finally:
-                loop.close()
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            prices = executor.submit(load_prices).result(timeout=10)
-
-        # Fall back to MENU_PRICES if DB returned nothing
-        if not prices:
+        # ── Prices: use in-memory cache if fresh, otherwise fetch from DB ──
+        if is_menu_cache_fresh():
             prices = dict(MENU_PRICES)
+        else:
+            from db import get_menu_items
+
+            def load_prices():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(get_menu_items())
+                finally:
+                    loop.close()
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                fetched = executor.submit(load_prices).result(timeout=10)
+
+            if fetched:
+                prices = update_menu_cache(fetched)
+            else:
+                prices = dict(MENU_PRICES)  # stale cache is better than nothing
 
         # ── Parse items + compute total ──────────────────────────────────────
         _QTY_WORDS = {
@@ -218,3 +219,17 @@ def show_category(category_name: str) -> str:
     return f"CATEGORY_TRIGGERED|{category_name}"
 
 
+
+@tool
+def send_single_choice_poll(question: str, options: str) -> str:
+    """
+    Send a single-choice poll to the customer in chat so they can pick exactly
+    one option (e.g. size, flavor, a yes/no preference). Use this instead of
+    asking in plain text when there's a short, well-defined list of choices.
+    Do not use for open-ended questions.
+
+    Args:
+        question: the poll question text
+        options: comma-separated list of 2+ choices, e.g. "Small, Medium, Large"
+    """
+    return f"POLL_TRIGGERED|{question}|{options}"

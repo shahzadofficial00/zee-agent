@@ -74,7 +74,7 @@ import logging
 from bot.matrix_client import matrix_client
 from bot.dsl_validator import safe_send_dsl
 from db import get_menu_items
-from agent.state import MENU_PRICES
+from agent.state import update_menu_cache
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +91,7 @@ async def send_menu(room_id: str):
         )
         return
 
-    MENU_PRICES.clear()
-    MENU_PRICES.update({
-        item["name"].lower(): int(item["price"])
-        for item in items
-    })
+    update_menu_cache(items)
 
     from db import get_ordering_enabled, get_all_item_orderable
     ordering_enabled = get_ordering_enabled()

@@ -1,230 +1,3 @@
-# from supabase import acreate_client
-# import os
-# from dotenv import load_dotenv
-# import logging
-
-# import supabase
-
-# load_dotenv()
-# logger = logging.getLogger(__name__)
-
-
-# async def _get_client():
-#     url = os.getenv("SUPABASE_URL")
-#     key = os.getenv("SUPABASE_KEY")
-#     if not url or not key:
-#         raise ValueError("SUPABASE_URL or SUPABASE_KEY missing from .env")
-#     return await acreate_client(url, key)
-
-
-# async def save_order(name, phone, items, total):
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table("orders")
-#             .insert({
-#                 "customer_name": name,
-#                 "phone": phone,
-#                 "items": items,
-#                 "total_amount": total,
-#                 "status": "pending",
-#             })
-#             .execute()
-#         )
-#         return result
-#     except Exception as e:
-#         logger.error(f"save_order failed: {e}")
-#         raise
-
-
-# async def save_reservation(name, phone, time, guests=1):
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table("reservations")
-#             .insert({
-#                 "customer_name": name,
-#                 "phone": phone,
-#                 "reservation_time": time,
-#                 "guests": guests,
-#             })
-#             .execute()
-#         )
-#         return result
-#     except Exception as e:
-#         logger.error(f"save_reservation failed: {e}")
-#         raise
-
-
-# async def get_menu_items():
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table("menu_items")
-#             .select("id, name, price, image")
-#             .eq("available", True)
-#             .execute()
-#         )
-#         return result.data or []
-#     except Exception as e:
-#         logger.error(f"get_menu_items failed: {e}")
-#         return []
-
-
-# # ── Payment functions — now all use payment_intents ──────────────────────────
-
-# async def save_payment(order_id, sender, room_id, amount, customer_name, phone):
-#     """
-#     This is now a no-op stub.
-#     Edge Function A already created the row in payment_intents.
-#     We keep this function so message_handler.py doesn't break.
-#     """
-#     logger.info(f"save_payment called for order {order_id} — row already exists in payment_intents via Edge Function A, skipping.")
-
-
-# async def get_payment(sender: str, order_id: str):
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table("payment_intents")
-#             .select("*")
-#             .eq("user_id", sender)
-#             .eq("order_id", order_id)
-#             .order("created_at", desc=True)
-#             .limit(1)
-#             .execute()
-#         )
-#         row = result.data[0] if result.data else None
-#         if row:
-#             row["sender"] = row.get("user_id")
-#         return row
-#     except Exception as e:
-#         logger.error(f"get_payment failed: {e}")
-#         return None
-
-
-# async def update_payment_status(order_id: str, status: str, sender: str | None = None):
-#     """Update payment_intents instead of payments."""
-#     try:
-#         db = await _get_client()
-#         query = (
-#             db.table("payment_intents")
-#             .update({
-#                 "status": status,
-#                 "updated_at": __import__('datetime').datetime.utcnow().isoformat(),
-#             })
-#             .eq("order_id", order_id)
-#         )
-#         if sender:
-#             query = query.eq("user_id", sender)
-#         await query.execute()
-#     except Exception as e:
-#         logger.error(f"update_payment_status failed: {e}")
-#         raise
-    
-# async def save_review(user_id, room_id, menu_item, order_id, rating, comment):
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table('reviews')
-#             .insert({
-#                 'user_id': user_id,
-#                 'room_id': room_id,
-#                 'menu_item': menu_item,
-#                 'order_id': order_id,
-#                 'rating': rating,
-#                 'comment': comment,
-#             })
-#             .execute()
-#         )
-#         return result
-#     except Exception as e:
-#         logger.error(f"save_review failed: {e}")
-#         raise
-    
-# async def insert_review_queue(room_id: str, order_id: str, menu_item: str, send_at):
-#     try:
-#         db = await _get_client()
-#         # Check if already queued
-#         existing = await db.table('review_queue').select('id').eq('order_id', order_id).eq('sent', False).execute()
-#         if existing.data:
-#             logger.info(f"⏭️ Review already queued for order {order_id}, skipping")
-#             return
-#         await db.table('review_queue').insert({
-#             'room_id': room_id,
-#             'order_id': order_id,
-#             'menu_item': menu_item,
-#             'send_at': send_at.isoformat(),
-#             'sent': False,
-#         }).execute()
-#     except Exception as e:
-#         logger.error(f"insert_review_queue failed: {e}")
-#         raise
-
-# async def get_pending_review_queue():
-#     try:
-#         db = await _get_client()
-#         result = await db.table('review_queue').select('*').eq('sent', False).execute()
-#         return result.data or []
-#     except Exception as e:
-#         logger.error(f"get_pending_review_queue failed: {e}")
-#         return []
-
-# async def mark_review_sent(review_id: str):
-#     try:
-#         db = await _get_client()
-#         await db.table('review_queue').update({'sent': True}).eq('id', review_id).execute()
-#     except Exception as e:
-#         logger.error(f"mark_review_sent failed: {e}")
-#         raise
-    
-        
-# async def get_pending_payment_by_user(sender: str, room_id: str):
-#     try:
-#         db = await _get_client()
-#         result = (
-#             await db.table("payment_intents")
-#             .select("*")
-#             .eq("user_id", sender)
-#             .eq("room_id", room_id)
-#             .eq("status", "pending")
-#             .order("created_at", desc=True)
-#             .limit(1)
-#             .execute()
-#         )
-#         return result.data[0] if result.data else None
-#     except Exception as e:
-#         logger.error(f"get_pending_payment_by_user failed: {e}")
-#         return None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import sqlite3
 import logging
 from datetime import datetime
@@ -327,6 +100,17 @@ def init_db():
     CREATE TABLE IF NOT EXISTS item_ordering (
         item_name TEXT PRIMARY KEY,
         orderable INTEGER DEFAULT 1
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS polls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        question TEXT NOT NULL,
+        options TEXT NOT NULL,
+        multi_select BOOLEAN DEFAULT 0,
+        created_at TEXT NOT NULL
     )
     """)
 
@@ -645,3 +429,31 @@ def get_all_item_orderable() -> dict:
     from agent.ordering_config import ITEM_ORDERABLE_OVERRIDES
     return {k.lower().strip(): v for k, v in ITEM_ORDERABLE_OVERRIDES.items()}
 
+
+
+import json
+
+def save_poll(room_id: str, event_id: str, question: str, options: list[str], multi_select: bool = False):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO polls (room_id, event_id, question, options, multi_select, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+        (room_id, event_id, question, json.dumps(options), int(multi_select)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_poll_by_event_id(event_id: str):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT room_id, question, options FROM polls WHERE event_id = ?",
+        (event_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "room_id": row["room_id"],
+        "question": row["question"],
+        "options": json.loads(row["options"]),
+    }

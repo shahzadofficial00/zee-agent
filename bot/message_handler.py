@@ -38,6 +38,190 @@ async def generate_unique_order_id() -> str:
     return generate_order_id() + secrets.choice(string.ascii_uppercase)
 
 
+async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
+    """Detect trigger markers in an agent result, dispatch the matching card/flow,
+    and return the cleaned reply text for conversation-history bookkeeping."""
+    reply = ""
+    if isinstance(result, dict) and "messages" in result:
+        last    = result["messages"][-1]
+        content = last.content if hasattr(last, "content") else str(last)
+        if isinstance(content, list):
+            reply = " ".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            ).strip()
+        else:
+            reply = content
+    else:
+        reply = str(result)
+    print(f"📋 ALL MESSAGES: {[str(m.content) for m in result['messages']]}")
+
+    triggered_menu = False
+    triggered_payment = None
+    triggered_order_history = False
+    triggered_item = None
+    triggered_category = None
+    triggered_poll = None
+    all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
+    print(f"🔍 ALL CONTENT STRINGS: {all_content}")
+    if any("ORDER_HISTORY_TRIGGERED" in c for c in all_content):
+        triggered_order_history = True
+    if any("MENU_TRIGGERED" in c for c in all_content):
+        triggered_menu = True
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "ITEM_TRIGGERED" in msg_content:
+                item_match = _re.search(r'ITEM_TRIGGERED\|(.+)', msg_content)
+                if item_match:
+                    triggered_item = item_match.group(1).strip()
+                break
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "CATEGORY_TRIGGERED" in msg_content:
+                cat_match = _re.search(r'CATEGORY_TRIGGERED\|(.+)', msg_content)
+                if cat_match:
+                    triggered_category = cat_match.group(1).strip()
+                break
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "POLL_TRIGGERED" in msg_content:
+                poll_match = _re.search(r'POLL_TRIGGERED\|(.+?)\|(.+)', msg_content)
+                if poll_match:
+                    question = poll_match.group(1).strip()
+                    options = [o.strip() for o in poll_match.group(2).split(",") if o.strip()]
+                    triggered_poll = {"question": question, "options": options}
+                break
+    if any("ORDER_HISTORY_CARD" in c for c in all_content):
+        triggered_order_history = True
+
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "PAYMENT_TRIGGERED" in msg_content:
+                payment_match = _re.search(
+                    r'PAYMENT_TRIGGERED\|(\d+)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)(?:\n|$)',
+                    msg_content
+                )
+                if payment_match:
+                    items_raw = payment_match.group(5) or ""
+                    import json as _json
+                    try:
+                        line_items = _json.loads(payment_match.group(6))
+                    except Exception:
+                        line_items = []
+                    triggered_payment = {
+                        "amount":      int(payment_match.group(1)),
+                        "name":        payment_match.group(2),
+                        "phone":       payment_match.group(3),
+                        "order_id":    payment_match.group(4).strip(),
+                        "items":       [s.strip() for s in items_raw.split(";") if s.strip()],
+                        "line_items":  line_items,
+                    }
+                    print(f"🔍 MATCH RESULT: {triggered_payment}")
+                break
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "ORDER_HISTORY_TRIGGERED" in msg_content:
+                triggered_order_history = True
+                break
+            elif isinstance(msg_content, list):
+                for block in msg_content:
+                    if "ORDER_HISTORY_TRIGGERED" in str(block):
+                        triggered_order_history = True
+                        break
+
+    reply = reply.replace("MENU_TRIGGERED", "").replace("MENU_CARD", "").strip()
+    reply = _re.sub(r'ITEM_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = _re.sub(r'CATEGORY_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = reply.replace("CATEGORY_CARD", "").strip()
+    reply = _re.sub(r'PAYMENT_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").strip()
+    reply = _re.sub(r'POLL_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = _re.sub(r'MULTI_POLL_TRIGGERED\|[^\n]+', '', reply).strip()
+    if "ORDER_HISTORY_CARD" in reply:
+        triggered_order_history = True
+    reply = reply.replace("ORDER_HISTORY_CARD", "").strip()
+
+    if triggered_menu:
+        reply = ""
+    if triggered_poll:
+        reply = ""
+
+    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll:
+        reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
+
+    print(f"🤖 REPLY: {reply}")
+    print(f"🍽️ TRIGGERED MENU: {triggered_menu}")
+    print(f"💳 TRIGGERED PAYMENT: {triggered_payment}")
+    print(f"📜 TRIGGERED ORDER HISTORY: {triggered_order_history}")
+
+    clean_reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").replace("ORDER_HISTORY_CARD", "").replace("MENU_TRIGGERED", "").replace("MENU_CARD", "").strip()
+
+    await matrix_client.room_typing(room_id, typing_state=False)
+
+    if triggered_menu:
+        await send_menu(room_id)
+    elif triggered_payment:
+        stable_order_id = await generate_unique_order_id()
+        print(f"🔑 stable_order_id: {stable_order_id}")
+        print(f"🔑 agent order_id: {triggered_payment['order_id']}")
+        last_orders[sender] = {**triggered_payment, "order_id": stable_order_id, "room_id": room_id}
+        from db import update_order_room_id
+        update_order_room_id(triggered_payment['order_id'], room_id)
+        from db import update_order_stable_id
+        update_order_stable_id(triggered_payment['order_id'], stable_order_id)
+        from bot.order_confirmation_service import send_order_confirmation_card
+        await send_order_confirmation_card(
+            room_id=room_id,
+            line_items=triggered_payment.get("line_items", []),
+            total=triggered_payment["amount"],
+            customer_name=triggered_payment["name"],
+            order_id=stable_order_id,
+            user_id=sender,
+        )
+        from bot.payment_service import create_payment_intent
+        await create_payment_intent(
+            room_id=room_id,
+            amount=triggered_payment["amount"],
+            customer_name=triggered_payment["name"],
+            phone=triggered_payment["phone"],
+            order_id=stable_order_id,
+            user_id=sender,
+        )
+        from config import REVIEW_CARD_ENABLED
+        if REVIEW_CARD_ENABLED:
+            async def _schedule_review():
+                try:
+                    await schedule_review(room_id=room_id, order_id=stable_order_id, menu_item="Your Order")
+                except Exception as e:
+                    logger.error(f"schedule_review failed for order {stable_order_id}: {e}", exc_info=True)
+            asyncio.create_task(_schedule_review())
+
+    elif triggered_order_history:
+        from bot.order_history_service import send_order_history_card
+        if reply:
+            await send_text(room_id, reply)
+        await send_order_history_card(room_id)
+    elif triggered_item:
+        await send_item_card(room_id, triggered_item)
+    elif triggered_category:
+        await send_category_card(room_id, triggered_category)
+    elif triggered_poll:
+        from bot.poll_service import send_single_choice_poll_to_room
+        await send_single_choice_poll_to_room(
+            matrix_client, room_id, triggered_poll["question"], triggered_poll["options"]
+        )
+        clean_reply = f"[Poll sent: {triggered_poll['question']}]"
+    else:
+        await send_text(room_id, reply)
+
+    return clean_reply
+
+
 async def handle_message(room: MatrixRoom, event: RoomMessageText):
     if event.server_timestamp < BOT_START_TIME:
         return
@@ -205,165 +389,13 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
                 logger.warning(f"⏰ Agent timeout for {sender}")
                 return
 
-        reply = ""
-        if isinstance(result, dict) and "messages" in result:
-            last    = result["messages"][-1]
-            content = last.content if hasattr(last, "content") else str(last)
-            if isinstance(content, list):
-                reply = " ".join(
-                    block.get("text", "") if isinstance(block, dict) else str(block)
-                    for block in content
-                ).strip()
-            else:
-                reply = content
-        else:
-            reply = str(result)
-        print(f"📋 ALL MESSAGES: {[str(m.content) for m in result['messages']]}")
-        triggered_menu = False
-        triggered_payment = None
-        triggered_order_history = False
-        triggered_item = None
-        triggered_category = None
-        all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
-        print(f"🔍 ALL CONTENT STRINGS: {all_content}")
-        if any("ORDER_HISTORY_TRIGGERED" in c for c in all_content):
-            triggered_order_history = True
-        if isinstance(result, dict) and "messages" in result:
-            for msg in result["messages"]:
-                msg_content = msg.content if hasattr(msg, "content") else ""
-                if isinstance(msg_content, str) and "ITEM_TRIGGERED" in msg_content:
-                    item_match = _re.search(r'ITEM_TRIGGERED\|(.+)', msg_content)
-                    if item_match:
-                        triggered_item = item_match.group(1).strip()
-                    break  
-        if isinstance(result, dict) and "messages" in result:
-            for msg in result["messages"]:
-                msg_content = msg.content if hasattr(msg, "content") else ""
-                if isinstance(msg_content, str) and "CATEGORY_TRIGGERED" in msg_content:
-                    cat_match = _re.search(r'CATEGORY_TRIGGERED\|(.+)', msg_content)
-                    if cat_match:
-                        triggered_category = cat_match.group(1).strip()
-                    break        
-        if any("ORDER_HISTORY_CARD" in c for c in all_content):
-            triggered_order_history = True
-
-        if isinstance(result, dict) and "messages" in result:
-            for msg in result["messages"]:
-                msg_content = msg.content if hasattr(msg, "content") else ""
-                if isinstance(msg_content, str) and "PAYMENT_TRIGGERED" in msg_content:
-                    payment_match = _re.search(
-                        r'PAYMENT_TRIGGERED\|(\d+)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)(?:\n|$)',
-                        msg_content
-                    )
-                    if payment_match:
-                        items_raw = payment_match.group(5) or ""
-                        import json as _json
-                        try:
-                            line_items = _json.loads(payment_match.group(6))
-                        except Exception:
-                            line_items = []
-                        triggered_payment = {
-                            "amount":      int(payment_match.group(1)),
-                            "name":        payment_match.group(2),
-                            "phone":       payment_match.group(3),
-                            "order_id":    payment_match.group(4).strip(),
-                            "items":       [s.strip() for s in items_raw.split(";") if s.strip()],
-                            "line_items":  line_items,
-                        }
-                        print(f"🔍 MATCH RESULT: {triggered_payment}")
-                    break
-        if isinstance(result, dict) and "messages" in result:
-            for msg in result["messages"]:
-                msg_content = msg.content if hasattr(msg, "content") else ""
-                if isinstance(msg_content, str) and "ORDER_HISTORY_TRIGGERED" in msg_content:
-                    triggered_order_history = True
-                    break
-                elif isinstance(msg_content, list):
-                    for block in msg_content:
-                        if "ORDER_HISTORY_TRIGGERED" in str(block):
-                            triggered_order_history = True
-                            break     
-
-
-        reply = reply.replace("MENU_TRIGGERED", "").replace("MENU_CARD", "").strip()
-        reply = _re.sub(r'ITEM_TRIGGERED\|[^\n]+', '', reply).strip()
-        reply = _re.sub(r'CATEGORY_TRIGGERED\|[^\n]+', '', reply).strip()
-        reply = reply.replace("CATEGORY_CARD", "").strip()
-        reply = _re.sub(r'PAYMENT_TRIGGERED\|[^\n]+', '', reply).strip()
-        reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").strip()
-        if "ORDER_HISTORY_CARD" in reply:
-           triggered_order_history = True
-        reply = reply.replace("ORDER_HISTORY_CARD", "").strip()
-
-        if triggered_menu:
-            reply = ""
-
-        if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category:
-            reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
-
-        print(f"🤖 REPLY: {reply}")
-        print(f"🍽️ TRIGGERED MENU: {triggered_menu}")
-        print(f"💳 TRIGGERED PAYMENT: {triggered_payment}")
-        print(f"📜 TRIGGERED ORDER HISTORY: {triggered_order_history}")
+        clean_reply = await _dispatch_agent_result(result, room_id, sender)
 
         conversation_histories[sender].append({"role": "user", "content": message})
-        clean_reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").replace("ORDER_HISTORY_CARD", "").replace("MENU_TRIGGERED", "").replace("MENU_CARD", "").strip()
         conversation_histories[sender].append({"role": "assistant", "content": clean_reply if clean_reply else "Got it!"})
 
         if len(conversation_histories[sender]) > 20:
             conversation_histories[sender] = conversation_histories[sender][-20:]
-
-        await matrix_client.room_typing(room_id, typing_state=False)
-
-        if triggered_menu:
-            await send_menu(room_id)
-        elif triggered_payment:
-            stable_order_id = await generate_unique_order_id()
-            print(f"🔑 stable_order_id: {stable_order_id}")
-            print(f"🔑 agent order_id: {triggered_payment['order_id']}")
-            last_orders[sender] = {**triggered_payment, "order_id": stable_order_id, "room_id": room_id}
-            from db import update_order_room_id
-            update_order_room_id(triggered_payment['order_id'], room_id)
-            from db import update_order_stable_id
-            update_order_stable_id(triggered_payment['order_id'], stable_order_id)
-            from bot.order_confirmation_service import send_order_confirmation_card
-            await send_order_confirmation_card(
-                room_id=room_id,
-                line_items=triggered_payment.get("line_items", []),
-                total=triggered_payment["amount"],
-                customer_name=triggered_payment["name"],
-                order_id=stable_order_id,
-                user_id=sender,
-            )
-            from bot.payment_service import create_payment_intent
-            await create_payment_intent(
-                room_id=room_id,
-                amount=triggered_payment["amount"],
-                customer_name=triggered_payment["name"],
-                phone=triggered_payment["phone"],
-                order_id=stable_order_id,
-                user_id=sender,
-            )
-            from config import REVIEW_CARD_ENABLED
-            if REVIEW_CARD_ENABLED:
-                async def _schedule_review():
-                    try:
-                        await schedule_review(room_id=room_id, order_id=stable_order_id, menu_item="Your Order")
-                    except Exception as e:
-                        logger.error(f"schedule_review failed for order {stable_order_id}: {e}", exc_info=True)
-                asyncio.create_task(_schedule_review())
-            
-        elif triggered_order_history:
-            from bot.order_history_service import send_order_history_card
-            if reply:
-                await send_text(room_id, reply)
-            await send_order_history_card(room_id) 
-        elif triggered_item:
-            await send_item_card(room_id, triggered_item)
-        elif triggered_category:
-            await send_category_card(room_id, triggered_category)    
-        else:
-            await send_text(room_id, reply)
 
     except Exception as e:
         await matrix_client.room_typing(room_id, typing_state=False)
@@ -391,4 +423,64 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
             comment=content.get('comment', ''),
         )
         await send_text(room.room_id, '⭐ Thanks for your review!')
+        return
+
+    # ── Poll response handler ─────────────────────────────────────────────────
+    if event.type == 'org.matrix.msc3381.poll.response':
+        content = event.source.get('content', {})
+        relates_to = content.get('m.relates_to', {})
+        poll_event_id = relates_to.get('event_id')
+        response_data = content.get('org.matrix.msc3381.poll.response', {})
+        answer_ids = response_data.get('answers', [])
+
+        if not poll_event_id or not answer_ids:
+            return
+
+        from db import get_poll_by_event_id
+        poll = get_poll_by_event_id(poll_event_id)
+        if not poll:
+            return
+
+        selected_options = []
+        for aid in answer_ids:
+            try:
+                idx = int(aid.split("-")[1]) - 1
+                selected_options.append(poll["options"][idx])
+            except (IndexError, ValueError):
+                continue
+
+        if not selected_options:
+            return
+
+        selected_text = ", ".join(selected_options)
+        sender = event.sender
+        room_id = room.room_id
+
+        print(f"🗳️ Poll response: {sender} answered '{poll['question']}' → {selected_text}")
+
+        if sender not in conversation_histories:
+            conversation_histories[sender] = []
+        conversation_histories[sender].append({
+            "role": "user",
+            "content": f"[Poll answer to \"{poll['question']}\"]: {selected_text}"
+        })
+
+        messages = []
+        for msg in conversation_histories[sender][-6:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+        await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
+        try:
+            result = await asyncio.wait_for(
+                agent.ainvoke({"messages": messages}),
+                timeout=30.0,
+            )
+            clean_reply = await _dispatch_agent_result(result, room_id, sender)
+            conversation_histories[sender].append({
+                "role": "assistant",
+                "content": clean_reply or "Got it!"
+            })
+        except asyncio.TimeoutError:
+            await matrix_client.room_typing(room_id, typing_state=False)
+            await send_text(room_id, "Sorry, that took too long! Please try again 🙏")
         return
