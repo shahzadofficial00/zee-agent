@@ -1,6 +1,7 @@
 from db import save_poll
 
 async def send_single_choice_poll_to_room(matrix_client, room_id: str, question: str, options: list[str]):
+    print("🔵 SINGLE CHOICE POLL SERVICE CALLED")
     answers = [
         {"id": f"answer-{i+1}", "org.matrix.msc1767.text": opt}
         for i, opt in enumerate(options)

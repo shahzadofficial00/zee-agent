@@ -1,8 +1,19 @@
 import sqlite3
 import logging
+import difflib
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def fuzzy_match_key(name: str, candidates: list[str], cutoff: float = 0.75) -> str | None:
+    """Match a (possibly misspelled) name against known keys. Exact match wins;
+    otherwise falls back to the closest candidate within the similarity cutoff."""
+    name = name.lower().strip()
+    if name in candidates:
+        return name
+    matches = difflib.get_close_matches(name, candidates, n=1, cutoff=cutoff)
+    return matches[0] if matches else None
 
 DB_PATH = "restaurant.db"
 
@@ -421,7 +432,9 @@ def get_ordering_enabled() -> bool:
 
 def get_item_orderable(item_name: str) -> bool:
     from agent.ordering_config import ITEM_ORDERABLE_OVERRIDES
-    return ITEM_ORDERABLE_OVERRIDES.get(item_name.lower().strip(), True)
+    overrides = {k.lower().strip(): v for k, v in ITEM_ORDERABLE_OVERRIDES.items()}
+    match = fuzzy_match_key(item_name, list(overrides.keys()))
+    return overrides[match] if match else True
 
 
 def get_all_item_orderable() -> dict:
@@ -446,7 +459,7 @@ def save_poll(room_id: str, event_id: str, question: str, options: list[str], mu
 def get_poll_by_event_id(event_id: str):
     conn = _connect()
     row = conn.execute(
-        "SELECT room_id, question, options FROM polls WHERE event_id = ?",
+        "SELECT room_id, question, options, multi_select FROM polls WHERE event_id = ?",
         (event_id,)
     ).fetchone()
     conn.close()
@@ -456,4 +469,5 @@ def get_poll_by_event_id(event_id: str):
         "room_id": row["room_id"],
         "question": row["question"],
         "options": json.loads(row["options"]),
+        "multi_select": bool(row["multi_select"]),
     }

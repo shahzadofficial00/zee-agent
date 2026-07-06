@@ -133,6 +133,15 @@ async def send_menu(room_id: str):
         logger.error("❌ Menu DSL invalid, not sending")
         return
 
+    if not ordering_enabled:
+        from bot.banner_service import send_banner_card
+        await send_banner_card(
+            room_id=room_id,
+            variant="outage",
+            title="Ordering Temporarily Paused",
+            message="We're not able to take new orders right now — you can still browse the menu.",
+        )
+
     await matrix_client.room_send(
         room_id,
         message_type="m.room.message",

@@ -19,6 +19,7 @@ conversation_histories: dict[str, list] = {}
 processed_event_ids: set[str] = set()
 last_orders: dict[str, dict] = {}
 order_counters: dict[str, int] = {}
+poll_response_timers: dict[str, asyncio.TimerHandle] = {}
 
 
 import secrets
@@ -36,6 +37,45 @@ async def generate_unique_order_id() -> str:
         if not await order_id_exists(candidate):
             return candidate
     return generate_order_id() + secrets.choice(string.ascii_uppercase)
+
+
+def _is_empty_agent_response(result) -> bool:
+    """True if the model returned neither text nor a tool call — a blank generation."""
+    if not isinstance(result, dict) or not result.get("messages"):
+        return True
+    last = result["messages"][-1]
+    content = last.content if hasattr(last, "content") else str(last)
+    if isinstance(content, list):
+        text = " ".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        ).strip()
+    else:
+        text = (content or "").strip()
+    tool_calls = getattr(last, "tool_calls", None)
+    return not text and not tool_calls
+
+
+async def _invoke_agent_with_retry(messages, sender: str, retries: int = 2):
+    """Gemini occasionally returns a blank generation (no text, no tool call) with
+    no error raised — retry before falling back to the apology text."""
+    result = None
+    for attempt in range(retries + 1):
+        result = await asyncio.wait_for(
+            agent.ainvoke({"messages": messages}),
+            timeout=30.0,
+        )
+        if not _is_empty_agent_response(result):
+            return result
+        last = result["messages"][-1] if isinstance(result, dict) and result.get("messages") else None
+        finish_reason = getattr(last, "response_metadata", {}).get("finish_reason") if last is not None else None
+        logger.warning(
+            f"⚠️ Empty agent response for {sender} (attempt {attempt + 1}/{retries + 1}), "
+            f"finish_reason={finish_reason}, retrying"
+        )
+        if attempt < retries:
+            await asyncio.sleep(0.8)
+    return result
 
 
 async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
@@ -62,8 +102,24 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
     triggered_item = None
     triggered_category = None
     triggered_poll = None
+    triggered_multi_poll = None
+    triggered_banner = None
     all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
     print(f"🔍 ALL CONTENT STRINGS: {all_content}")
+
+    # ── Model call failed (retries exhausted) — show an outage banner instead of the raw error ──
+    if any("Model call failed" in c for c in all_content):
+        triggered_banner = {
+            "variant": "outage",
+            "title": "Having Trouble Responding",
+            "message": "Zee is briefly having trouble responding right now — please try again in a moment.",
+            "meta": "",
+        }
+        reply = ""
+        await matrix_client.room_typing(room_id, typing_state=False)
+        from bot.banner_service import send_banner_card
+        await send_banner_card(room_id=room_id, **triggered_banner)
+        return f"[Banner sent: {triggered_banner['title']}]"
     if any("ORDER_HISTORY_TRIGGERED" in c for c in all_content):
         triggered_order_history = True
     if any("MENU_TRIGGERED" in c for c in all_content):
@@ -87,12 +143,37 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
     if isinstance(result, dict) and "messages" in result:
         for msg in result["messages"]:
             msg_content = msg.content if hasattr(msg, "content") else ""
-            if isinstance(msg_content, str) and "POLL_TRIGGERED" in msg_content:
+            if isinstance(msg_content, str) and "POLL_TRIGGERED" in msg_content and "MULTI_POLL_TRIGGERED" not in msg_content:
                 poll_match = _re.search(r'POLL_TRIGGERED\|(.+?)\|(.+)', msg_content)
                 if poll_match:
                     question = poll_match.group(1).strip()
                     options = [o.strip() for o in poll_match.group(2).split(",") if o.strip()]
                     triggered_poll = {"question": question, "options": options}
+                break
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "MULTI_POLL_TRIGGERED" in msg_content:
+                match = _re.search(r'MULTI_POLL_TRIGGERED\|(.+?)\|(.+)', msg_content)
+                if match:
+                    question = match.group(1).strip()
+                    options = [o.strip() for o in match.group(2).split(",") if o.strip()]
+                    triggered_multi_poll = {"question": question, "options": options}
+                break
+            
+                    
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "BANNER_TRIGGERED" in msg_content:
+                banner_match = _re.search(r'BANNER_TRIGGERED\|(.+?)\|(.+?)\|(.*?)\|(.*?)(?:\n|$)', msg_content)
+                if banner_match:
+                    triggered_banner = {
+                        "variant": banner_match.group(1).strip(),
+                        "title":   banner_match.group(2).strip(),
+                        "message": banner_match.group(3).strip(),
+                        "meta":    banner_match.group(4).strip(),
+                    }
                 break
     if any("ORDER_HISTORY_CARD" in c for c in all_content):
         triggered_order_history = True
@@ -142,16 +223,18 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
     reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").strip()
     reply = _re.sub(r'POLL_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = _re.sub(r'MULTI_POLL_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = _re.sub(r'BANNER_TRIGGERED\|[^\n]+', '', reply).strip()
     if "ORDER_HISTORY_CARD" in reply:
         triggered_order_history = True
     reply = reply.replace("ORDER_HISTORY_CARD", "").strip()
 
     if triggered_menu:
         reply = ""
-    if triggered_poll:
+    if triggered_banner:
         reply = ""
 
-    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll:
+    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_banner:
+
         reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
 
     print(f"🤖 REPLY: {reply}")
@@ -208,14 +291,35 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
         await send_order_history_card(room_id)
     elif triggered_item:
         await send_item_card(room_id, triggered_item)
+        if triggered_banner:
+            from bot.banner_service import send_banner_card
+            await send_banner_card(room_id=room_id, **triggered_banner)
     elif triggered_category:
         await send_category_card(room_id, triggered_category)
     elif triggered_poll:
+        if reply:
+            await send_text(room_id, reply)
         from bot.poll_service import send_single_choice_poll_to_room
         await send_single_choice_poll_to_room(
             matrix_client, room_id, triggered_poll["question"], triggered_poll["options"]
         )
-        clean_reply = f"[Poll sent: {triggered_poll['question']}]"
+        clean_reply = reply or f"[Poll sent: {triggered_poll['question']}]"
+    elif triggered_multi_poll:
+        if reply:
+            await send_text(room_id, reply)
+        from bot.flavor_poll_service import send_flavor_preference_poll_to_room
+        await send_flavor_preference_poll_to_room(matrix_client, room_id)
+        clean_reply = reply or f"[Multi-select poll sent: {triggered_multi_poll['question']}]"
+    elif triggered_banner:
+        from bot.banner_service import send_banner_card
+        await send_banner_card(
+            room_id=room_id,
+            variant=triggered_banner["variant"],
+            title=triggered_banner["title"],
+            message=triggered_banner["message"],
+            meta=triggered_banner["meta"],
+        )
+        clean_reply = f"[Banner sent: {triggered_banner['title']}]"
     else:
         await send_text(room_id, reply)
 
@@ -379,10 +483,7 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
             metadata={"sender": sender, "room_id": room_id},
         ):
             try:
-                result = await asyncio.wait_for(
-                    agent.ainvoke({"messages": messages}),
-                    timeout=30.0,
-                )
+                result = await _invoke_agent_with_retry(messages, sender)
             except asyncio.TimeoutError:
                 await matrix_client.room_typing(room_id, typing_state=False)
                 await send_text(room_id, "Sorry, that took too long! Please try again 🙏")
@@ -399,7 +500,13 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
 
     except Exception as e:
         await matrix_client.room_typing(room_id, typing_state=False)
-        await send_text(room_id, "Sorry, I ran into a small issue. Please try again!")
+        from bot.banner_service import send_banner_card
+        await send_banner_card(
+            room_id=room_id,
+            variant="outage",
+            title="Something Went Wrong",
+            message="We ran into a small issue on our end — please try again in a moment.",
+        )
         logger.error(f"handle_message error: {e}", exc_info=True)
 
 
@@ -460,27 +567,51 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
 
         if sender not in conversation_histories:
             conversation_histories[sender] = []
+        conversation_histories[sender] = [
+            m for m in conversation_histories[sender]
+            if not m["content"].startswith(f"[Poll answer to \"{poll['question']}\"]")
+        ]
         conversation_histories[sender].append({
             "role": "user",
             "content": f"[Poll answer to \"{poll['question']}\"]: {selected_text}"
         })
 
-        messages = []
-        for msg in conversation_histories[sender][-6:]:
-            messages.append({"role": msg["role"], "content": msg["content"]})
+        async def _run_agent_for_poll_answer():
+            messages = []
+            for msg in conversation_histories[sender][-6:]:
+                messages.append({"role": msg["role"], "content": msg["content"]})
 
-        await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
-        try:
-            result = await asyncio.wait_for(
-                agent.ainvoke({"messages": messages}),
-                timeout=30.0,
-            )
-            clean_reply = await _dispatch_agent_result(result, room_id, sender)
-            conversation_histories[sender].append({
-                "role": "assistant",
-                "content": clean_reply or "Got it!"
-            })
-        except asyncio.TimeoutError:
-            await matrix_client.room_typing(room_id, typing_state=False)
-            await send_text(room_id, "Sorry, that took too long! Please try again 🙏")
+            await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
+            try:
+                result = await _invoke_agent_with_retry(messages, sender)
+                clean_reply = await _dispatch_agent_result(result, room_id, sender)
+                conversation_histories[sender].append({
+                    "role": "assistant",
+                    "content": clean_reply or "Got it!"
+                })
+            except asyncio.TimeoutError:
+                await matrix_client.room_typing(room_id, typing_state=False)
+                await send_text(room_id, "Sorry, that took too long! Please try again 🙏")
+
+        if not poll.get("multi_select"):
+            # Single-choice poll — reply immediately, no debounce.
+            if sender in poll_response_timers:
+                poll_response_timers[sender].cancel()
+                poll_response_timers.pop(sender, None)
+            await _run_agent_for_poll_answer()
+            return
+
+        # Multi-select poll — debounce so the agent only replies once the
+        # customer stops tapping, instead of after every single selection.
+        if sender in poll_response_timers:
+            poll_response_timers[sender].cancel()
+
+        async def _handle_after_debounce():
+            poll_response_timers.pop(sender, None)
+            await _run_agent_for_poll_answer()
+
+        loop = asyncio.get_event_loop()
+        poll_response_timers[sender] = loop.call_later(
+            2.0, lambda: asyncio.create_task(_handle_after_debounce())
+        )
         return
