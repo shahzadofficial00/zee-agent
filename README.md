@@ -9,10 +9,12 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 ## Features
 
 - Menu browsing (full menu, single item, category) as rich Matrix cards
+- Deterministic checkout flow — per-item size and special-instructions polls, saved-customer-info reuse, and final confirmation, all as real poll cards (not left to the LLM to decide)
 - Order placement with a payment card (Swich gateway) and receipt
+- Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
 - Table reservations
-- Single-choice polls (e.g. size/flavor picks) via native Matrix polls
+- Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards
 - Post-order review prompts on a delay
 - Per-customer name/phone memory across conversations
 
@@ -26,21 +28,28 @@ Restaurant Agent/
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
-│   ├── tools.py                # Agent tools (menu, order, reservation, poll, history)
+│   ├── tools/                  # One file per agent tool (menu, order, reservation, polls, history, banner)
 │   ├── prompt.py                # System prompt for "Zee"
-│   ├── middleware.py           # Guardrails, retry, summarization, PII
+│   ├── middleware.py           # Guardrails, summarization, retry, PII, call limits
 │   ├── memory_tools.py         # Customer name/phone persistence
-│   ├── state.py                # Shared MENU_PRICES / CACHED_MENU cache
-│   ├── context.py              # Context dataclass (currently unused)
+│   ├── state.py                # Shared MENU_PRICES cache
+│   ├── context.py              # Context dataclass (user_id), passed to create_agent
 │   └── ordering_config.py      # Master ordering switch + per-item overrides
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
-    ├── message_handler.py      # Main message router + agent orchestration
+    ├── message_handler.py      # Main message router, deterministic order/tip flow, agent orchestration
     ├── menu_service.py         # Sends menu/item/category DSL cards
-    ├── payment_service.py      # Swich gateway integration
+    ├── payment_service.py      # Swich gateway integration (orders and tips)
+    ├── tip_service.py          # Post-order tip request card
     ├── order_confirmation_service.py  # Order receipt card
     ├── order_history_service.py       # Order history card
-    ├── poll_service.py         # Native Matrix single-choice polls
+    ├── poll_service.py         # Single-choice poll cards
+    ├── flavor_poll_service.py  # Multi-select flavor poll
+    ├── ranking_poll_service.py # Drag-to-reorder poll
+    ├── rating_poll_service.py  # Post-order star rating poll
+    ├── special_instructions_poll_service.py  # Free-text special instructions poll
+    ├── poll_history_service.py # Poll history card
+    ├── poll_results_service.py # Aggregate poll results card
     ├── review_service.py       # Review card
     ├── review_scheduler.py     # Async scheduler for post-order reviews
     └── dsl_validator.py        # JSON schema validation for DSL payloads
@@ -84,9 +93,9 @@ Startup sequence:
 
 ## Database
 
-**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, polls.
+**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings.
 
-**Supabase** — remote, async: payment intents, reviews, review queue, authoritative menu source.
+**Supabase** — remote, async: payment intents (orders and tips), reviews, review queue, authoritative menu source.
 
 ## Ordering Control
 
@@ -102,4 +111,4 @@ ITEM_ORDERABLE_OVERRIDES = {
 
 ## Documentation
 
-See [`CLAUDE.md`](./CLAUDE.md) for a deeper dive into the architecture, the DSL protocol, the payment flow (which spans this bot, the Flutter app, and Supabase Edge Functions), the agent's middleware stack, and known fragility/gaps.
+See [`CLAUDE.md`](./CLAUDE.md) for a deeper dive into the architecture, the deterministic order/tip flow, the DSL protocol, the payment flow (which spans this bot, the Flutter app, and Supabase Edge Functions), the agent's middleware stack, and known fragility/gaps.
