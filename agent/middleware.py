@@ -1,12 +1,13 @@
 from typing import Any
 from langchain.agents.middleware import (
-    ModelRetryMiddleware,
     SummarizationMiddleware,
     ToolRetryMiddleware,
     PIIMiddleware,
     AgentMiddleware,
     AgentState,
     hook_config,
+    ModelCallLimitMiddleware,
+    ToolCallLimitMiddleware,
 )
 from langgraph.runtime import Runtime
 from agent.llm import llm
@@ -22,12 +23,10 @@ class RestaurantGuardrail(AgentMiddleware):
 
     @hook_config(can_jump_to=["end"])
     def before_agent(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        if not state["messages"]:
+        humans = [m for m in state["messages"] if m.type == "human"]
+        if not humans:
             return None
-        first = state["messages"][0]
-        if first.type != "human":
-            return None
-        content = first.content.lower()
+        content = humans[-1].content.lower()
         for keyword in self.BANNED:
             if keyword in content:
                 return {
@@ -39,19 +38,9 @@ class RestaurantGuardrail(AgentMiddleware):
                 }
         return None
 
-model_retry = ModelRetryMiddleware(
-    max_retries=4,
-    retry_on=lambda e: "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e),
-    backoff_factor=2.0,
-    initial_delay=10.0,
-    max_delay=120.0,
-    jitter=True,
-    on_failure="continue",
-)
-
 summarization = SummarizationMiddleware(
     model=llm,
-    trigger=("messages", 12),
+    trigger=("tokens", 8000),
     keep=("messages", 6),
 )
 
@@ -69,4 +58,17 @@ pii_phone = PIIMiddleware(
     strategy="none",
     apply_to_input=False,
     apply_to_output=False,
+)
+
+# No checkpointer is configured (each turn is a fresh agent.ainvoke call), so only
+# run_limit (scoped to a single invocation) applies — thread_limit would need a
+# checkpointer to track calls across turns and is left unset.
+model_call_limit = ModelCallLimitMiddleware(
+    run_limit=10,
+    exit_behavior="end",
+)
+
+tool_call_limit = ToolCallLimitMiddleware(
+    run_limit=10,
+    exit_behavior="continue",
 )

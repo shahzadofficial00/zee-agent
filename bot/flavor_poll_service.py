@@ -1,54 +1,54 @@
-import aiohttp
 import uuid
-from urllib.parse import quote
+import logging
+from bot.dsl_validator import safe_send_dsl
+from bot.matrix_client import matrix_client as _matrix_client
 from db import save_poll
 
-HOMESERVER = "https://chat.jaeno.ai"
+logger = logging.getLogger(__name__)
+
+QUESTION = "What flavors do you enjoy?"
+OPTIONS = ["Bold & Strong", "Creamy", "Chocolatey", "Sweet", "Nutty", "Fruity", "Earthy & Matcha"]
+
 
 async def send_flavor_preference_poll_to_room(matrix_client, room_id: str):
     print("🟣 FLAVOR POLL SERVICE CALLED")
-    question = "What flavors do you enjoy?"
-    options = ["Bold & Strong", "Creamy", "Chocolatey", "Sweet", "Nutty", "Fruity", "Earthy & Matcha"]
+    poll_id = uuid.uuid4().hex
 
-    answers = [
-        {"id": f"answer-{i+1}", "org.matrix.msc1767.text": opt}
-        for i, opt in enumerate(options)
-    ]
-
-    content = {
-        "org.matrix.msc1767.text": question + "\n" + "\n".join(
-            f"{i}. {opt}" for i, opt in enumerate(options)
-        ),
-        "org.matrix.msc3381.poll.start": {
-            "kind": "org.matrix.msc3381.poll.disclosed",
-            "max_selections": len(answers),
-            "question": {
-                "org.matrix.msc1767.text": question,
-                "msgtype": "m.text",
-                "body": question,
-            },
-            "answers": answers,
+    dsl = {
+        "v": 1,
+        "type": "poll",
+        "data": {
+            "poll_id": poll_id,
+            "question": QUESTION,
+            "poll_type": "multi_select",
+            "options": OPTIONS,
+            "allow_multiple": True,
+            "submitted": False,
+            "selected": None,
         },
     }
 
-    print(f"🗳️ DEBUG flavor poll: len(answers)={len(answers)} max_selections={len(answers)}")
+    if not safe_send_dsl(dsl):
+        logger.error("❌ Flavor poll DSL invalid, not sending")
+        return None
 
-    txn_id = uuid.uuid4().hex
-    encoded_room_id = quote(room_id, safe="")
-    url = f"{HOMESERVER}/_matrix/client/v3/rooms/{encoded_room_id}/send/org.matrix.msc3381.poll.start/{txn_id}"
-
-    headers = {
-        "Authorization": f"Bearer {matrix_client.access_token}",
-        "Content-Type": "application/json",
+    content = {
+        "msgtype": "m.text",
+        "body": QUESTION,
+        "ai.jaeno.dsl": dsl,
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.put(url, json=content, headers=headers) as resp:
-            data = await resp.json()
-            event_id = data.get("event_id")
-            print(f"🗳️ Flavor poll sent: event_id={event_id} status={resp.status}")
-
-    if event_id:
-        save_poll(room_id, event_id, question, options, multi_select=True)
-
-    return event_id
+    try:
+        response = await matrix_client.room_send(
+            room_id,
+            message_type="m.room.message",
+            content=content,
+        )
+        event_id = getattr(response, "event_id", None)
+        if event_id:
+            save_poll(room_id, event_id, QUESTION, OPTIONS, multi_select=True, poll_id=poll_id, poll_type="multi_select")
+            print(f"🟣 Flavor poll DSL sent: event_id={event_id}")
+        return event_id
+    except Exception as e:
+        logger.error(f"❌ Flavor poll send failed: {e}", exc_info=True)
+        return None

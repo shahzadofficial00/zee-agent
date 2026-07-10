@@ -1,16 +1,13 @@
 import uuid
 import logging
 from bot.dsl_validator import safe_send_dsl
-from bot.matrix_client import matrix_client
 from db import save_poll
 
 logger = logging.getLogger(__name__)
 
 
-async def send_single_choice_poll_to_room(
-    matrix_client, room_id: str, question: str, options: list[str]
-):
-    print("🔵 SINGLE CHOICE POLL SERVICE CALLED")
+async def send_rating_poll_to_room(matrix_client, room_id: str, item_name: str):
+    print(f"⭐ RATING POLL SERVICE CALLED for {item_name}")
     poll_id = uuid.uuid4().hex
 
     dsl = {
@@ -18,9 +15,11 @@ async def send_single_choice_poll_to_room(
         "type": "poll",
         "data": {
             "poll_id": poll_id,
-            "question": question,
-            "poll_type": "single_choice",
-            "options": options,
+            "question": f"How would you rate your {item_name}?",
+            "poll_type": "rating",
+            "rating_style": "stars",
+            "rating_max": 5,
+            "options": [],
             "allow_multiple": False,
             "submitted": False,
             "selected": None,
@@ -28,12 +27,12 @@ async def send_single_choice_poll_to_room(
     }
 
     if not safe_send_dsl(dsl):
-        logger.error("❌ Poll DSL invalid, not sending")
+        logger.error("❌ Rating poll DSL invalid, not sending")
         return None
 
     content = {
         "msgtype": "m.text",
-        "body": question,
+        "body": f"How would you rate your {item_name}?",
         "ai.jaeno.dsl": dsl,
     }
 
@@ -45,9 +44,14 @@ async def send_single_choice_poll_to_room(
         )
         event_id = getattr(response, "event_id", None)
         if event_id:
-            save_poll(room_id, event_id, question, options, multi_select=False, poll_id=poll_id, poll_type="single_choice")
-            print(f"🔵 Single choice poll DSL sent: event_id={event_id}")
+            save_poll(
+                room_id, event_id,
+                f"How would you rate your {item_name}?",
+                [], multi_select=False,
+                poll_id=poll_id, poll_type="rating",
+            )
+            print(f"⭐ Rating poll sent: event_id={event_id}")
         return event_id
     except Exception as e:
-        logger.error(f"❌ Poll send failed: {e}", exc_info=True)
+        logger.error(f"❌ Rating poll send failed: {e}", exc_info=True)
         return None

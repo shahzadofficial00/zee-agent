@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import re
 import logging
+import json
 from langchain_core.tools import tool
 from agent.state import MENU_PRICES, is_menu_cache_fresh, update_menu_cache
 
@@ -80,6 +81,17 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
                 prices = dict(MENU_PRICES)  # stale cache is better than nothing
 
         # ── Parse items + compute total ──────────────────────────────────────
+        def parse_size_and_instructions(name: str):
+            """Split a trailing '(Size - instructions)' or '(Size)' suffix into parts."""
+            match = re.search(r'\(([^)]*)\)\s*$', name)
+            if not match:
+                return None, None
+            inner = match.group(1).strip()
+            if " - " in inner:
+                size, instructions = inner.split(" - ", 1)
+                return size.strip() or None, instructions.strip() or None
+            return inner or None, None
+
         def resolve_price(name: str) -> int:
             from db import fuzzy_match_key
             # Strip a trailing "(Medium)"-style size/option suffix before matching —
@@ -119,7 +131,11 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
             if price == 0:
                 not_found.append(name)
             total += price * qty
-            line_items.append({"name": name, "qty": qty, "unit_price": price})
+            size, instructions = parse_size_and_instructions(name)
+            line_items.append({
+                "name": name, "qty": qty, "unit_price": price,
+                "size": size, "instructions": instructions,
+            })
 
         # ── Guard: refuse bad totals instead of saving a Rs. 0 order ─────────
         if not_found or total < 10:
@@ -146,6 +162,7 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
                         phone=phone,
                         items=items_list,
                         total=total,
+                        line_items=line_items,
                     )
                 )
                 if result and isinstance(result, dict) and result.get("data"):

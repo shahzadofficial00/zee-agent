@@ -1,16 +1,19 @@
 import uuid
 import logging
 from bot.dsl_validator import safe_send_dsl
-from bot.matrix_client import matrix_client
+from bot.matrix_client import matrix_client as _matrix_client
 from db import save_poll
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_QUESTION = "Any special instructions for your order?"
 
-async def send_single_choice_poll_to_room(
-    matrix_client, room_id: str, question: str, options: list[str]
+async def send_special_instructions_poll_to_room(
+    matrix_client, room_id: str,
+    placeholder: str = "e.g. extra hot, less sugar",
+    question: str = DEFAULT_QUESTION,
 ):
-    print("🔵 SINGLE CHOICE POLL SERVICE CALLED")
+    print("📝 SPECIAL INSTRUCTIONS POLL SERVICE CALLED")
     poll_id = uuid.uuid4().hex
 
     dsl = {
@@ -19,16 +22,17 @@ async def send_single_choice_poll_to_room(
         "data": {
             "poll_id": poll_id,
             "question": question,
-            "poll_type": "single_choice",
-            "options": options,
+            "poll_type": "open_text",
+            "options": [placeholder],  # used as hint text in text field
             "allow_multiple": False,
             "submitted": False,
             "selected": None,
         },
     }
+    # ... rest unchanged
 
     if not safe_send_dsl(dsl):
-        logger.error("❌ Poll DSL invalid, not sending")
+        logger.error("❌ Special instructions poll DSL invalid, not sending")
         return None
 
     content = {
@@ -45,9 +49,9 @@ async def send_single_choice_poll_to_room(
         )
         event_id = getattr(response, "event_id", None)
         if event_id:
-            save_poll(room_id, event_id, question, options, multi_select=False, poll_id=poll_id, poll_type="single_choice")
-            print(f"🔵 Single choice poll DSL sent: event_id={event_id}")
+            save_poll(room_id, event_id, question, [placeholder], multi_select=False, poll_id=poll_id, poll_type="open_text")
+            print(f"📝 Special instructions poll sent: event_id={event_id}")
         return event_id
     except Exception as e:
-        logger.error(f"❌ Poll send failed: {e}", exc_info=True)
+        logger.error(f"❌ Special instructions poll send failed: {e}", exc_info=True)
         return None

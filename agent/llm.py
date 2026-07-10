@@ -12,7 +12,8 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0.4,
-    max_retries=2,
-    request_timeout=15,
+    max_retries=6,
+    request_timeout=25,
     rate_limiter=rate_limiter,
+    thinking_budget=0,
 )

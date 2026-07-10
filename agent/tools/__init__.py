@@ -7,6 +7,12 @@ from agent.tools.show_category import show_category
 from agent.tools.send_single_choice_poll import send_single_choice_poll
 from agent.tools.send_flavor_preference_poll import send_flavor_preference_poll
 from agent.tools.show_banner import show_banner
+from agent.tools.send_special_instructions_poll import send_special_instructions_poll
+from agent.tools.send_rating_poll import send_rating_poll
+from agent.tools.show_poll_history import show_poll_history
+from agent.tools.send_ranking_poll import send_ranking_poll
+
+
 
 __all__ = [
     "show_menu",
@@ -18,4 +24,8 @@ __all__ = [
     "send_single_choice_poll",
     "send_flavor_preference_poll",
     "show_banner",
+    "send_special_instructions_poll",
+    "send_rating_poll",
+    "show_poll_history",
+    "send_ranking_poll",
 ]

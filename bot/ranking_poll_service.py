@@ -1,16 +1,13 @@
 import uuid
 import logging
 from bot.dsl_validator import safe_send_dsl
-from bot.matrix_client import matrix_client
 from db import save_poll
 
 logger = logging.getLogger(__name__)
 
 
-async def send_single_choice_poll_to_room(
-    matrix_client, room_id: str, question: str, options: list[str]
-):
-    print("🔵 SINGLE CHOICE POLL SERVICE CALLED")
+async def send_ranking_poll_to_room(matrix_client, room_id: str, question: str, options: list[str]):
+    print(f"🔀 RANKING POLL SERVICE CALLED: {question}")
     poll_id = uuid.uuid4().hex
 
     dsl = {
@@ -19,7 +16,7 @@ async def send_single_choice_poll_to_room(
         "data": {
             "poll_id": poll_id,
             "question": question,
-            "poll_type": "single_choice",
+            "poll_type": "ranking",
             "options": options,
             "allow_multiple": False,
             "submitted": False,
@@ -28,7 +25,7 @@ async def send_single_choice_poll_to_room(
     }
 
     if not safe_send_dsl(dsl):
-        logger.error("❌ Poll DSL invalid, not sending")
+        logger.error("❌ Ranking poll DSL invalid, not sending")
         return None
 
     content = {
@@ -45,9 +42,9 @@ async def send_single_choice_poll_to_room(
         )
         event_id = getattr(response, "event_id", None)
         if event_id:
-            save_poll(room_id, event_id, question, options, multi_select=False, poll_id=poll_id, poll_type="single_choice")
-            print(f"🔵 Single choice poll DSL sent: event_id={event_id}")
+            save_poll(room_id, event_id, question, options, multi_select=False, poll_id=poll_id, poll_type="ranking")
+            print(f"🔀 Ranking poll DSL sent: event_id={event_id}")
         return event_id
     except Exception as e:
-        logger.error(f"❌ Poll send failed: {e}", exc_info=True)
+        logger.error(f"❌ Ranking poll send failed: {e}", exc_info=True)
         return None
