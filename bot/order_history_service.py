@@ -6,8 +6,8 @@ from db import get_orders_by_room, get_payment_statuses
 
 logger = logging.getLogger(__name__)
 
-async def send_order_history_card(room_id: str):
-    orders = get_orders_by_room(room_id)
+async def send_order_history_card(room_id: str, sender: str = None):
+    orders = get_orders_by_room(room_id, sender=sender)
 
     stable_ids = [o["stable_order_id"] for o in orders if o.get("stable_order_id")]
     payment_statuses = await get_payment_statuses(stable_ids)

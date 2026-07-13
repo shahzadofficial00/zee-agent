@@ -254,6 +254,7 @@ async def _place_deterministic_order(sender: str, room_id: str) -> None:
         "items": items_str,
         "customer_name": state["customer_name"],
         "phone": state["customer_phone"],
+        "sender": sender,
     })
     if "ORDER_SAVED" in result_text:
         distinct_items = ", ".join(state["distinct_items"])
@@ -763,7 +764,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
         from bot.order_history_service import send_order_history_card
         if reply:
             await send_text(room_id, reply)
-        await send_order_history_card(room_id)
+        await send_order_history_card(room_id, sender)
     elif triggered_item:
         await send_item_card(room_id, triggered_item)
         if triggered_banner:
@@ -953,6 +954,25 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
             message = f"I want to order: {items_str}"
             # NOT returning here — falls through to the agent below
 
+        # ── bid_confirmation — customer placed/updated a bid on a live auction ──
+        # Deterministic, no LLM: re-validate server-side (the client only checks
+        # the amount locally) and record it as the customer's current bid.
+        elif dsl_type == 'bid_confirmation':
+            from db import place_bid_if_higher
+            data = dsl.get('data', {})
+            auction_id = data.get('auction_id', '').strip()
+            try:
+                amount = float(data.get('amount', 0))
+            except (TypeError, ValueError):
+                amount = 0
+
+            result = place_bid_if_higher(auction_id, sender, room_id, amount)
+            if not result['accepted']:
+                await send_text(room_id, f"❌ {result['reason']}")
+            else:
+                logger.info(f"🔨 Bid accepted | {auction_id} | {sender} | Rs {amount}")
+            return
+
         # ── poll — the bot's own poll card being echoed back to the room ─────
         elif dsl_type == 'poll':
             # Bot's own poll card being echoed back — skip
@@ -1046,7 +1066,7 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
         if _ORDER_HISTORY_PATTERN.search(message.lower().strip()):
             await matrix_client.room_typing(room_id, typing_state=False)
             from bot.order_history_service import send_order_history_card
-            await send_order_history_card(room_id)
+            await send_order_history_card(room_id, sender)
             return
 
         # ── Fast-path: payment intent request bypasses the agent entirely ────

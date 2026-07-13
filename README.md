@@ -17,6 +17,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards
 - Post-order review prompts on a delay
 - Per-customer name/phone memory across conversations
+- Live auctions — server-validated bidding (highest bid wins, no LLM involved), automatic close on deadline, winner gets a real Swich payment card
 
 ## Project Structure
 
@@ -52,6 +53,8 @@ Restaurant Agent/
     ├── poll_results_service.py # Aggregate poll results card
     ├── review_service.py       # Review card
     ├── review_scheduler.py     # Async scheduler for post-order reviews
+    ├── auction_service.py      # Auction + auction-result DSL cards, auction creation helper
+    ├── auction_scheduler.py    # Async scheduler that closes due auctions and pays out the winner
     └── dsl_validator.py        # JSON schema validation for DSL payloads
 ```
 
@@ -74,7 +77,8 @@ Startup sequence:
 2. Matrix login + full sync
 3. Event callbacks registered
 4. Review scheduler started as a background task
-5. `sync_forever()` — main event loop
+5. Auction scheduler started as a background task
+6. `sync_forever()` — main event loop
 
 ## Environment Variables (`.env`)
 
@@ -93,7 +97,7 @@ Startup sequence:
 
 ## Database
 
-**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings.
+**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids.
 
 **Supabase** — remote, async: payment intents (orders and tips), reviews, review queue, authoritative menu source.
 
@@ -108,6 +112,24 @@ ITEM_ORDERABLE_OVERRIDES = {
     "espresso": False,           # blocks ordering for this item only
 }
 ```
+
+## Auctions
+
+There's no chat command or admin UI to start an auction yet — call `create_and_send_auction()` directly (see `test.py` for a working example):
+
+```python
+from bot.auction_service import create_and_send_auction
+
+await create_and_send_auction(
+    room_id=ROOM_ID,
+    title="Signature Blend",
+    starting_price=1000,
+    min_bid=1000,
+    ends_in_seconds=300,
+)
+```
+
+Bids come in from the client as a `bid_confirmation` DSL event and are re-validated server-side (the app's own min-bid check is cosmetic only) — see `db.place_bid_if_higher()`. The `auction_scheduler.py` background task closes auctions past their deadline every 30s, picks the highest bidder, creates a real Swich payment intent for them, and sends every bidder a personalized result card. Winning amounts under Swich's 10 PKR minimum won't get a payment card.
 
 ## Documentation
 

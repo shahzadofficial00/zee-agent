@@ -30,7 +30,7 @@ def _strip_qty(item_str: str) -> str:
 
 
 @tool
-def confirm_order(items: str, customer_name: str, phone: str) -> str:
+def confirm_order(items: str, customer_name: str, phone: str, sender: str = "") -> str:
     """
     Save a confirmed order to the database.
     Only call this after collecting: items, customer full name, and phone number.
@@ -39,6 +39,7 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
         items: a COMMA-separated list of items, one per item — never join items with "and".
             Use "x<qty>" for quantities. Example: "Latte, Espresso x2, Bono Latte"
             (NOT "Latte and Espresso x2").
+        sender: internal use only, do not set — the system fills this in automatically.
     """
     try:
         from db import get_ordering_enabled, get_item_orderable
@@ -163,6 +164,7 @@ def confirm_order(items: str, customer_name: str, phone: str) -> str:
                         items=items_list,
                         total=total,
                         line_items=line_items,
+                        sender=sender or None,
                     )
                 )
                 if result and isinstance(result, dict) and result.get("data"):

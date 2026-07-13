@@ -12,6 +12,7 @@ from bot.matrix_client import matrix_client
 from bot.message_handler import handle_message, handle_custom_event
 from config import BOT_PASSWORD, ROOM_ID
 from bot.review_scheduler import run_review_scheduler
+from bot.auction_scheduler import run_auction_scheduler
 from db import init_db
 
 load_dotenv()
@@ -34,6 +35,7 @@ async def main():
     matrix_client.add_event_callback(handle_custom_event, UnknownEvent)
     
     asyncio.create_task(run_review_scheduler())
+    asyncio.create_task(run_auction_scheduler())
 
    
 

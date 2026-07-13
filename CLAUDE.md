@@ -51,6 +51,8 @@ Restaurant Agent/
     ├── poll_results_service.py # Aggregate results follow-up card (currently rating only)
     ├── review_service.py       # Review card
     ├── review_scheduler.py     # Async scheduler for post-order reviews
+    ├── auction_service.py      # auction/auction_result DSL cards + create_and_send_auction() creation helper
+    ├── auction_scheduler.py    # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
     └── dsl_validator.py        # JSON schema validation for DSL payloads
 ```
 
@@ -122,16 +124,18 @@ message_handler.py
 | `polls` | Native Matrix poll metadata (question, options, poll_type) |
 | `poll_answers` | Every DSL/native poll answer, for poll history + results |
 | `item_ratings` | Post-order star ratings per item |
+| `auctions` | Auction metadata (title, starting_price, min_bid, ends_at, room_id, closed flag) |
+| `auction_bids` | One row per (auction_id, user_id) — a rebid updates the row in place rather than inserting a new one |
 
 **Supabase** — remote, async:
 | Table | Purpose |
 |---|---|
-| `payment_intents` | Payment records for both orders AND tips (created by Supabase Edge Function), keyed by `order_id` (`ORD-XXXXXX` or `TIP-XXXXXX`) |
+| `payment_intents` | Payment records for orders, tips, AND auction winners (created by Supabase Edge Function), keyed by `order_id` (`ORD-XXXXXX`, `TIP-XXXXXX`, or `AUC-XXXXXX`) |
 | `reviews` | Customer reviews |
 | `review_queue` | Scheduled review card sends |
 | `menu_items` | Authoritative menu source (fetched by agent at order time) |
 
-Orders are saved to SQLite first, then a `stable_order_id` (e.g. `ORD-AB1C2D`) is generated and linked to the Supabase payment intent. Tips reuse the exact same `payment_intents` mechanism with a `TIP-XXXXXX` id instead — no separate tips table.
+Orders are saved to SQLite first, then a `stable_order_id` (e.g. `ORD-AB1C2D`) is generated and linked to the Supabase payment intent. Tips reuse the exact same `payment_intents` mechanism with a `TIP-XXXXXX` id instead — no separate tips table. Auction winners reuse it again with the auction's own `AUC-XXXXXX` id as the `order_id` — the auction_id IS the payment order_id, no separate ID generation needed.
 
 ---
 
@@ -153,12 +157,15 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `poll_history` | v1 | "Show my poll history" card |
 | `poll_results` | v1 | Aggregate results follow-up (rating average; `results` breakdown array supported but currently unused for other poll types) |
 | `tip_request` | v1 | Post-order tip prompt (presets, custom amount, decline) |
+| `auction` | v1 | Live auction card (image, starting price, min bid, countdown) |
+| `auction_result` | v1 | Inbound trigger is client-side (`bid_confirmation`); this outbound card is sent per-bidder when an auction closes — `is_winner` + a `Pay Now` button (via `order_id`) for the winner only |
 
 Incoming DSL events from the client are routed by `dsl.type`:
 - `review_submit` — saves customer review
 - `order_summary` — pre-built order from the menu card UI, feeds into the deterministic order flow
 - `tip_selected` — customer picked a preset/custom tip amount → creates a real payment intent + sends a `payment` card (no LLM)
 - `tip_declined` — customer skipped the tip → plain text ack (no LLM)
+- `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
 
 ---
@@ -258,6 +265,26 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 
 ---
 
+## Auctions
+
+**Creation:** no chat command or admin UI exists yet — `bot/auction_service.py::create_and_send_auction()` is called directly (see `test.py` for a working example) to insert a SQLite `auctions` row and send the `auction` DSL card. Swap in a real trigger (staff chat command, Supabase-polling like the menu, or an in-app staff screen) later without touching bidding/closing at all — this was a deliberate scope cut, see Known Fragility/Gaps.
+
+**Bidding (deterministic, no LLM):**
+1. Customer taps "Place Bid" in the app → client sends a `bid_confirmation` DSL event (the app's own min-bid check is client-side only, not trustworthy)
+2. `message_handler.py` re-validates via `db.place_bid_if_higher()` — one `BEGIN IMMEDIATE` SQLite transaction that reads the current highest bid and writes the new one atomically, so two near-simultaneous bids can't both read the same stale "highest" and both get accepted
+3. A rebid from the same customer updates their existing `auction_bids` row (`UNIQUE(auction_id, user_id)` + `ON CONFLICT ... DO UPDATE`) rather than inserting a new one
+4. Bids at or before the auction's `ends_at`, or after it's been marked `closed`, are rejected with a reason string sent back as plain text
+
+**Closing (`bot/auction_scheduler.py::run_auction_scheduler()`, background asyncio task, polls every 30s — same shape as the review scheduler):**
+1. Finds auctions where `closed = 0` and `ends_at` has passed (filtered in Python, not SQL, to dodge SQLite `datetime('now')` vs. ISO-string format mismatches — see `get_open_auctions_past_end()`)
+2. Marks the auction closed, computes the highest bidder
+3. For the winner: looks up their saved name/phone (`db.get_customer` — skipped with a logged error if never saved, same rule tips already follow) and calls `payment_service.create_payment_intent()`, reusing the exact same Swich mechanism as orders/tips. The auction_id itself doubles as the payment `order_id` — no separate ID generation.
+4. Sends every bidder (not just the winner) a personalized `auction_result` card — `is_winner` and the "Pay Now" button are per-recipient, so this is one `room_send` per bidder, not a single room broadcast
+
+**Known gotcha already hit and fixed:** amounts pulled from SQLite (`REAL` column) come back as Python floats — Matrix's canonical JSON forbids raw floats in event content (same reason `poll_results_data.average_x10`/`percent` are ints, see DSL Protocol). `winning_amount`, `starting_price`, and `min_bid` are explicitly cast to `int` right before they go into the DSL payload in `auction_service.py`/`auction_scheduler.py`. If you add a new call site that sends these fields, cast there too.
+
+---
+
 ## Environment Variables (`.env`)
 
 | Variable | Purpose |
@@ -289,7 +316,8 @@ Startup sequence:
 2. Matrix login + full sync
 3. Event callbacks registered
 4. Review scheduler started as background task
-5. `sync_forever()` — main event loop
+5. Auction scheduler started as background task
+6. `sync_forever()` — main event loop
 
 ---
 
@@ -324,3 +352,6 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 5. **In-memory checkout state doesn't survive a restart** — see Conversation History section above. Not yet fixed.
 6. **No dedicated `tips` table** — tip payments live in `payment_intents` distinguished only by the `TIP-` prefix; fine for the payment mechanics, not great for tip-specific reporting.
 7. **`poll_results` DSL's `results` breakdown array is only ever populated for rating polls** — the Flutter side already renders a generic percentage-bar breakdown for any poll type, but no Python service computes/sends that data for size/flavor/confirmation polls yet.
+8. **No auction creation trigger** — `create_and_send_auction()` has to be called manually (see Auctions section); there's no chat command, Supabase-polling, or staff UI wired up yet. Deliberate scope cut, not an oversight.
+9. **No permission check on who can create an auction or place a bid** — same class of gap as #2, just unmitigated here (ordering_config's "hand-edited, restart-required" approach doesn't apply to auctions since creation is a runtime function call). Anyone who can call `create_and_send_auction()` or send a `bid_confirmation` DSL event can act.
+10. **Auction `payment_intents` reuse the winner's Matrix `user_id`/saved customer info** — same "no `tips` table"-style tradeoff as #6: fine for payment mechanics, no dedicated auction-analytics table if that's ever needed.
