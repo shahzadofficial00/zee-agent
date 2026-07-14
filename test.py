@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from bot.matrix_client import matrix_client
-from bot.auction_service import create_and_send_auction
+from bot.auction.auction_service import create_and_send_auction
 from config import BOT_PASSWORD, ROOM_ID
 
 

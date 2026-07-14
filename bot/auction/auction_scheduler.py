@@ -8,8 +8,8 @@ from db import (
     get_highest_bid,
     get_customer,
 )
-from bot.auction_service import send_auction_result_card
-from bot.payment_service import create_payment_intent
+from bot.auction.auction_service import send_auction_result_card
+from bot.payment.payment_service import create_payment_intent
 
 logger = logging.getLogger(__name__)
 

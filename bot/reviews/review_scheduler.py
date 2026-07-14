@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from db import get_pending_review_queue, mark_review_sent, insert_review_queue
-from bot.review_service import send_review_card
+from bot.reviews.review_service import send_review_card
 
 logger = logging.getLogger(__name__)
 

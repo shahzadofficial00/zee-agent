@@ -17,7 +17,16 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 Restaurant Agent/
 ├── main.py                     # Entry point
 ├── config.py                   # Matrix credentials, feature flags
-├── db.py                       # Database layer (SQLite + Supabase)
+├── db/                         # Database layer (SQLite + Supabase), one file per domain
+│   ├── __init__.py             # Re-exports every function so `from db import X` keeps working; assembles init_db()
+│   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
+│   ├── orders.py               # Orders + reservations
+│   ├── customers.py            # Saved name/phone lookup
+│   ├── menu.py                 # Menu items + ordering on/off switches
+│   ├── payments.py             # Supabase payment_intents CRUD
+│   ├── reviews.py               # Supabase reviews + review queue
+│   ├── polls.py                 # Polls, poll answers, item ratings
+│   └── auctions.py              # Auctions, bids, the locked-transaction bid logic
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -27,34 +36,51 @@ Restaurant Agent/
 │   ├── state.py                # Shared MENU_PRICES cache, populated by confirm_order.py at order time
 │   ├── context.py              # Context dataclass (user_id) — passed as context_schema to create_agent
 │   ├── ordering_config.py      # Master ordering switch + per-item overrides
-│   └── tools/                  # One file per agent tool
-│       ├── show_menu.py / show_item.py / show_category.py
-│       ├── confirm_order.py / confirm_reservation.py
-│       ├── show_order_history.py / show_poll_history.py
-│       ├── send_single_choice_poll.py / send_flavor_preference_poll.py
-│       ├── send_ranking_poll.py / send_rating_poll.py / send_special_instructions_poll.py
-│       └── show_banner.py
+│   └── tools/                  # One file per agent tool, grouped by domain
+│       ├── menu/                # show_menu.py, show_item.py, show_category.py
+│       ├── orders/              # confirm_order.py, confirm_reservation.py, show_order_history.py
+│       ├── polls/               # send_single_choice_poll.py, send_flavor_preference_poll.py,
+│       │                        # send_ranking_poll.py, send_rating_poll.py,
+│       │                        # send_special_instructions_poll.py, show_poll_history.py
+│       └── show_banner.py       # Single tool, stays at root (no domain group needed)
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
-    ├── message_handler.py      # Main message router, deterministic order/tip flow, agent orchestration
-    ├── menu_service.py         # Sends menu/item/category DSL cards
-    ├── payment_service.py      # Swich gateway integration (orders AND tips)
-    ├── order_confirmation_service.py  # Order receipt card
-    ├── order_history_service.py       # Order history card
-    ├── tip_service.py          # Sends the post-order tip_request card
-    ├── poll_service.py         # Single-choice poll cards (size, Yes/No confirm, etc.)
-    ├── flavor_poll_service.py  # Multi-select flavor preference poll
-    ├── ranking_poll_service.py # Drag-to-reorder poll
-    ├── rating_poll_service.py  # Post-order star rating poll (per item)
-    ├── special_instructions_poll_service.py  # Free-text "special instructions" poll
-    ├── poll_history_service.py # "Show my poll history" card
-    ├── poll_results_service.py # Aggregate results follow-up card (currently rating only)
-    ├── review_service.py       # Review card
-    ├── review_scheduler.py     # Async scheduler for post-order reviews
-    ├── auction_service.py      # auction/auction_result DSL cards + create_and_send_auction() creation helper
-    ├── auction_scheduler.py    # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
-    └── dsl_validator.py        # JSON schema validation for DSL payloads
+    ├── dsl_validator.py        # JSON schema validation for DSL payloads
+    ├── banner_service.py       # Banner DSL card
+    ├── message_handler.py      # Thin entrypoint: handle_message() + handle_custom_event(), routes to bot/router/
+    ├── router/                 # Extracted message_handler internals — state machine, agent glue, event routing
+    │   ├── state.py             # The shared in-memory dicts (conversation_histories, order_flows, pending_orders, etc.)
+    │   ├── ids.py                # Order/tip ID generation (ORD-XXXXXX, TIP-XXXXXX)
+    │   ├── order_flow.py         # The deterministic per-item size/instructions/confirm checkout state machine
+    │   ├── agent_invoke.py       # Agent retry wrapper (handles blank-generation retries)
+    │   ├── agent_dispatch.py     # Parses tool signal strings out of agent output, dispatches the matching card
+    │   ├── dsl_text_events.py    # Inbound DSL-over-text handling: tip_selected/declined, order_summary, bid_confirmation, review_submit
+    │   └── custom_events.py      # handle_custom_event: poll responses, review submit, legacy native polls
+    ├── menu/
+    │   └── menu_service.py      # Sends menu/item/category DSL cards
+    ├── orders/
+    │   ├── order_confirmation_service.py  # Order receipt card
+    │   └── order_history_service.py       # Order history card
+    ├── payment/
+    │   ├── payment_service.py   # Swich gateway integration (orders AND tips)
+    │   └── tip_service.py       # Sends the post-order tip_request card
+    ├── polls/
+    │   ├── poll_service.py      # Single-choice poll cards (size, Yes/No confirm, etc.)
+    │   ├── flavor_poll_service.py  # Multi-select flavor preference poll
+    │   ├── ranking_poll_service.py # Drag-to-reorder poll
+    │   ├── rating_poll_service.py  # Post-order star rating poll (per item)
+    │   ├── special_instructions_poll_service.py  # Free-text "special instructions" poll
+    │   ├── poll_history_service.py # "Show my poll history" card
+    │   └── poll_results_service.py # Aggregate results follow-up card (currently rating only)
+    ├── reviews/
+    │   ├── review_service.py    # Review card
+    │   └── review_scheduler.py  # Async scheduler for post-order reviews
+    └── auction/
+        ├── auction_service.py    # auction/auction_result DSL cards + create_and_send_auction() creation helper
+        └── auction_scheduler.py  # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
 ```
+
+`bot/`, `agent/tools/`, and `db.py` were all reorganized into these domain-grouped packages for clean architecture — matrix_client.py/dsl_validator.py/banner_service.py/message_handler.py stayed at `bot/` root as shared infra rather than being folded into a domain, since they're used across every domain rather than owned by one. `message_handler.py` itself dropped from ~1,380 lines to ~220 by extracting the checkout state machine, agent dispatch, and DSL event routing into `bot/router/` — every extraction was a pure move (function bodies copied verbatim, only imports rewired), no logic changed.
 
 ---
 
@@ -106,11 +132,13 @@ message_handler.py
                     └── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
 ```
 
-**Why a deterministic order flow exists at all:** the agent has no checkpointer — every poll answer is a fresh `agent.ainvoke()` with no real memory across turns. On repeat orders in the same conversation, the LLM would start imitating its own flattened text history and silently skip a tool call (e.g. reply with the size question as plain text instead of calling `send_single_choice_poll`) instead of progressing the flow. Since "which item still needs a size/instructions/confirmation answer" is fully mechanical, `message_handler.py` now owns that entire sequence — including calling `confirm_order` directly — and only hands off to the LLM for parts that genuinely need judgment (free-form chat, reservations, or an order whose item list couldn't be parsed).
+**Why a deterministic order flow exists at all:** the agent has no checkpointer — every poll answer is a fresh `agent.ainvoke()` with no real memory across turns. On repeat orders in the same conversation, the LLM would start imitating its own flattened text history and silently skip a tool call (e.g. reply with the size question as plain text instead of calling `send_single_choice_poll`) instead of progressing the flow. Since "which item still needs a size/instructions/confirmation answer" is fully mechanical, that entire sequence — including calling `confirm_order` directly — is owned by code (`bot/router/order_flow.py`, driven by `bot/message_handler.py`), and only hands off to the LLM for parts that genuinely need judgment (free-form chat, reservations, or an order whose item list couldn't be parsed).
 
 ---
 
 ## Database
+
+The `db/` package re-exports every function through `db/__init__.py`, so every call site elsewhere in the repo still does `from db import save_order, get_customer, ...` unchanged — only the internal file layout is split by domain (see Project Structure above). `init_db()` assembles the schema by calling each domain module's `init_*_schema(cur)` against one shared connection, in place of the single monolithic function it used to be.
 
 **SQLite** (`restaurant.db`) — local, synchronous:
 | Table | Purpose |
@@ -231,8 +259,8 @@ ITEM_ORDERABLE_OVERRIDES = {
 **⚠️ This flow spans three codebases — Python bot, Flutter app, AND Deno/Supabase Edge Functions (separate repo). The Python bot has zero involvement past step 5.**
 
 Flow (orders):
-1. `confirm_order` is invoked (directly by `message_handler._place_deterministic_order`, or by the LLM in the fallback path) and returns `PAYMENT_TRIGGERED` with amount, name, phone, order_id, line_items
-2. `message_handler` generates a unique `stable_order_id` (e.g. `ORD-AB1C2D`)
+1. `confirm_order` is invoked (directly by `bot/router/order_flow.py::_place_deterministic_order`, or by the LLM in the fallback path) and returns `PAYMENT_TRIGGERED` with amount, name, phone, order_id, line_items
+2. `bot/router/agent_dispatch.py` generates a unique `stable_order_id` (e.g. `ORD-AB1C2D`) via `bot/router/ids.py`
 3. `create_payment_intent()` calls Supabase Edge Function (`smooth-processor`) to create a `payment_intents` row, status `pending`
 4. `build_payment_url()` constructs a signed Swich checkout URL (HMAC-SHA256)
 5. `send_order_confirmation_card()` sends receipt DSL card (with "Pay Now" button) — Python's job ends here
@@ -240,14 +268,14 @@ Flow (orders):
 7. **Real confirmation:** Swich's backend calls the `swich-callback` Edge Function directly (server-to-server, HMAC verified). This function flips `payment_intents.status` to `paid` in Supabase AND sends the `payment_confirmation` DSL card straight into the Matrix room via raw HTTP with `MATRIX_BOT_TOKEN` — bypassing the Python bot entirely.
 8. Flutter's WebView-close redirect and Realtime listener on `payment_intents` are secondary UI sync only — not the source of truth.
 
-**Dead code, do not rely on it:** Flutter's `_sendPaymentSuccessEvent()` sends a custom `com.jaino.payment_success` event, and `message_handler.py` has a `dsl_type == 'payment_success'` branch — but the event Flutter sends isn't nested under `ai.jaeno.dsl`, so the branch never matches. This path has never fired in production. Safe to remove, or wire up properly if a fallback is ever wanted.
+**Dead code, do not rely on it:** Flutter's `_sendPaymentSuccessEvent()` sends a custom `com.jaino.payment_success` event, and `bot/router/dsl_text_events.py` has a `dsl_type == 'payment_success'` branch — but the event Flutter sends isn't nested under `ai.jaeno.dsl`, so the branch never matches. This path has never fired in production. Safe to remove, or wire up properly if a fallback is ever wanted.
 
 Cancellation: any message containing "cancel" cancels the pending payment intent (Python-side only, doesn't touch the edge functions).
 
 ### Tips
 
-After a successful order, `bot/tip_service.py` automatically sends a `tip_request` card (presets `[50, 100, 200]` PKR + custom amount + decline option) — no LLM tool call, fired directly from `_place_deterministic_order` on `ORDER_SAVED`. When the customer responds:
-- **Preset/custom amount** (`tip_selected` DSL event) → `message_handler.py` looks up the customer's saved name/phone (`db.get_customer`), generates a `TIP-XXXXXX` id, and calls `payment_service.send_payment_card()` — the exact same function used for order payments — so the tip gets a real Swich checkout card. Rejects amounts under 10 PKR (Swich's minimum).
+After a successful order, `bot/payment/tip_service.py` automatically sends a `tip_request` card (presets `[50, 100, 200]` PKR + custom amount + decline option) — no LLM tool call, fired directly from `_place_deterministic_order` on `ORDER_SAVED`. When the customer responds:
+- **Preset/custom amount** (`tip_selected` DSL event) → `bot/router/dsl_text_events.py` looks up the customer's saved name/phone (`db.get_customer`), generates a `TIP-XXXXXX` id, and calls `payment_service.send_payment_card()` — the exact same function used for order payments — so the tip gets a real Swich checkout card. Rejects amounts under 10 PKR (Swich's minimum).
 - **Decline** (`tip_declined`) → plain text acknowledgment, nothing else happens.
 
 No dedicated `tips` table exists yet — tip payments are just `payment_intents` rows distinguished by the `TIP-` prefix on `order_id`. If tip-specific reporting/analytics is ever needed, that's the natural next addition.
@@ -267,21 +295,21 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 
 ## Auctions
 
-**Creation:** no chat command or admin UI exists yet — `bot/auction_service.py::create_and_send_auction()` is called directly (see `test.py` for a working example) to insert a SQLite `auctions` row and send the `auction` DSL card. Swap in a real trigger (staff chat command, Supabase-polling like the menu, or an in-app staff screen) later without touching bidding/closing at all — this was a deliberate scope cut, see Known Fragility/Gaps.
+**Creation:** no chat command or admin UI exists yet — `bot/auction/auction_service.py::create_and_send_auction()` is called directly (see `test.py` for a working example) to insert a SQLite `auctions` row and send the `auction` DSL card. Swap in a real trigger (staff chat command, Supabase-polling like the menu, or an in-app staff screen) later without touching bidding/closing at all — this was a deliberate scope cut, see Known Fragility/Gaps.
 
 **Bidding (deterministic, no LLM):**
 1. Customer taps "Place Bid" in the app → client sends a `bid_confirmation` DSL event (the app's own min-bid check is client-side only, not trustworthy)
-2. `message_handler.py` re-validates via `db.place_bid_if_higher()` — one `BEGIN IMMEDIATE` SQLite transaction that reads the current highest bid and writes the new one atomically, so two near-simultaneous bids can't both read the same stale "highest" and both get accepted
+2. `bot/router/dsl_text_events.py` re-validates via `db.place_bid_if_higher()` — one `BEGIN IMMEDIATE` SQLite transaction that reads the current highest bid and writes the new one atomically, so two near-simultaneous bids can't both read the same stale "highest" and both get accepted
 3. A rebid from the same customer updates their existing `auction_bids` row (`UNIQUE(auction_id, user_id)` + `ON CONFLICT ... DO UPDATE`) rather than inserting a new one
 4. Bids at or before the auction's `ends_at`, or after it's been marked `closed`, are rejected with a reason string sent back as plain text
 
-**Closing (`bot/auction_scheduler.py::run_auction_scheduler()`, background asyncio task, polls every 30s — same shape as the review scheduler):**
+**Closing (`bot/auction/auction_scheduler.py::run_auction_scheduler()`, background asyncio task, polls every 30s — same shape as the review scheduler):**
 1. Finds auctions where `closed = 0` and `ends_at` has passed (filtered in Python, not SQL, to dodge SQLite `datetime('now')` vs. ISO-string format mismatches — see `get_open_auctions_past_end()`)
 2. Marks the auction closed, computes the highest bidder
 3. For the winner: looks up their saved name/phone (`db.get_customer` — skipped with a logged error if never saved, same rule tips already follow) and calls `payment_service.create_payment_intent()`, reusing the exact same Swich mechanism as orders/tips. The auction_id itself doubles as the payment `order_id` — no separate ID generation.
 4. Sends every bidder (not just the winner) a personalized `auction_result` card — `is_winner` and the "Pay Now" button are per-recipient, so this is one `room_send` per bidder, not a single room broadcast
 
-**Known gotcha already hit and fixed:** amounts pulled from SQLite (`REAL` column) come back as Python floats — Matrix's canonical JSON forbids raw floats in event content (same reason `poll_results_data.average_x10`/`percent` are ints, see DSL Protocol). `winning_amount`, `starting_price`, and `min_bid` are explicitly cast to `int` right before they go into the DSL payload in `auction_service.py`/`auction_scheduler.py`. If you add a new call site that sends these fields, cast there too.
+**Known gotcha already hit and fixed:** amounts pulled from SQLite (`REAL` column) come back as Python floats — Matrix's canonical JSON forbids raw floats in event content (same reason `poll_results_data.average_x10`/`percent` are ints, see DSL Protocol). `winning_amount`, `starting_price`, and `min_bid` are explicitly cast to `int` right before they go into the DSL payload in `bot/auction/auction_service.py`/`bot/auction/auction_scheduler.py`. If you add a new call site that sends these fields, cast there too.
 
 ---
 
@@ -328,15 +356,16 @@ Per-user conversation history is kept in memory (`conversation_histories` dict):
 - Capped at 20 messages per user
 - Lost on bot restart (no persistence)
 
-The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`) is **also** in-memory only, in `message_handler.py`. A bot restart mid-checkout currently loses that state — this is a known gap, not yet fixed (a write-through SQLite table for `order_flows` keyed by `user_id` is the planned fix, not yet implemented).
+The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`) is **also** in-memory only, now living in `bot/router/state.py` (moved out of `message_handler.py` during the clean-architecture split, same dicts, same lifetime — see Project Structure). A bot restart mid-checkout currently loses that state — this is a known gap, not yet fixed (a write-through SQLite table for `order_flows` keyed by `user_id` is the planned fix, not yet implemented).
 
 ---
 
 ## Key Design Decisions
 
-- **Signal strings** — tools return sentinel strings (e.g. `PAYMENT_TRIGGERED|...`) instead of side effects; `message_handler` parses them and dispatches. This keeps tools pure and testable.
-- **Deterministic order flow over LLM tool-calling** — every step of checkout (size, instructions, customer-info reuse, final confirmation, placing the order) is driven by explicit code in `message_handler.py`, not the LLM deciding to call a tool each turn. This was a deliberate fix: with no checkpointer, the LLM would silently drop tool calls (replying with plain text instead of sending a poll card) on repeat orders in the same conversation. The LLM is only in the loop for genuinely open-ended parts (menu Q&A, reservations, free-form chat, or an order whose item list can't be parsed).
+- **Signal strings** — tools return sentinel strings (e.g. `PAYMENT_TRIGGERED|...`) instead of side effects; `bot/router/agent_dispatch.py` parses them and dispatches. This keeps tools pure and testable.
+- **Deterministic order flow over LLM tool-calling** — every step of checkout (size, instructions, customer-info reuse, final confirmation, placing the order) is driven by explicit code (`bot/router/order_flow.py`), not the LLM deciding to call a tool each turn. This was a deliberate fix: with no checkpointer, the LLM would silently drop tool calls (replying with plain text instead of sending a poll card) on repeat orders in the same conversation. The LLM is only in the loop for genuinely open-ended parts (menu Q&A, reservations, free-form chat, or an order whose item list can't be parsed).
 - **Split DB** — orders/reservations in SQLite (always available, no network), payments/reviews in Supabase (need real-time access from mobile clients).
+- **Domain-grouped packages over flat directories** — `bot/`, `agent/tools/`, and `db.py` were reorganized (this session) into subfolders/files per domain (polls, menu, orders, payment, reviews, auction) instead of one flat pile of same-level files. Every move was a pure relocation — function bodies copied verbatim, cross-references rewired, public import surface (`from db import X`, `from bot.message_handler import handle_message`, etc.) kept unchanged — verified by actually importing every module afterward, not just checking syntax.
 - **stable_order_id** — a human-readable ID (`ORD-XXXXXX`, or `TIP-XXXXXX` for tips) separate from the SQLite auto-increment, used as the Supabase payment intent key.
 - **Fast-path bypass** — common intents (menu, pay, order history, cancel) are intercepted before the agent to reduce latency and LLM cost.
 - **DSL validation** — all outbound DSL payloads are validated against a JSON schema before sending to prevent malformed UI cards reaching clients. Inbound DSL (customer responses) is not schema-validated.

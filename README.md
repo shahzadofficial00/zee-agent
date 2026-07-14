@@ -25,11 +25,14 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 Restaurant Agent/
 ├── main.py                     # Entry point
 ├── config.py                   # Matrix credentials, feature flags
-├── db.py                       # Database layer (SQLite + Supabase)
+├── db/                         # Database layer (SQLite + Supabase), one file per domain
+│   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
+│   ├── orders.py / customers.py / menu.py / payments.py
+│   └── reviews.py / polls.py / auctions.py
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
-│   ├── tools/                  # One file per agent tool (menu, order, reservation, polls, history, banner)
+│   ├── tools/                  # One file per agent tool, grouped into menu/, orders/, polls/ (+ show_banner.py at root)
 │   ├── prompt.py                # System prompt for "Zee"
 │   ├── middleware.py           # Guardrails, summarization, retry, PII, call limits
 │   ├── memory_tools.py         # Customer name/phone persistence
@@ -38,25 +41,27 @@ Restaurant Agent/
 │   └── ordering_config.py      # Master ordering switch + per-item overrides
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
-    ├── message_handler.py      # Main message router, deterministic order/tip flow, agent orchestration
-    ├── menu_service.py         # Sends menu/item/category DSL cards
-    ├── payment_service.py      # Swich gateway integration (orders and tips)
-    ├── tip_service.py          # Post-order tip request card
-    ├── order_confirmation_service.py  # Order receipt card
-    ├── order_history_service.py       # Order history card
-    ├── poll_service.py         # Single-choice poll cards
-    ├── flavor_poll_service.py  # Multi-select flavor poll
-    ├── ranking_poll_service.py # Drag-to-reorder poll
-    ├── rating_poll_service.py  # Post-order star rating poll
-    ├── special_instructions_poll_service.py  # Free-text special instructions poll
-    ├── poll_history_service.py # Poll history card
-    ├── poll_results_service.py # Aggregate poll results card
-    ├── review_service.py       # Review card
-    ├── review_scheduler.py     # Async scheduler for post-order reviews
-    ├── auction_service.py      # Auction + auction-result DSL cards, auction creation helper
-    ├── auction_scheduler.py    # Async scheduler that closes due auctions and pays out the winner
-    └── dsl_validator.py        # JSON schema validation for DSL payloads
+    ├── dsl_validator.py        # JSON schema validation for DSL payloads
+    ├── banner_service.py       # Banner DSL card
+    ├── message_handler.py      # Thin entrypoint — routes to bot/router/
+    ├── router/                 # Checkout state machine, agent dispatch, DSL/custom event routing
+    │   ├── state.py / ids.py / order_flow.py
+    │   └── agent_invoke.py / agent_dispatch.py / dsl_text_events.py / custom_events.py
+    ├── menu/menu_service.py               # Sends menu/item/category DSL cards
+    ├── payment/payment_service.py         # Swich gateway integration (orders and tips)
+    ├── payment/tip_service.py             # Post-order tip request card
+    ├── orders/order_confirmation_service.py  # Order receipt card
+    ├── orders/order_history_service.py       # Order history card
+    ├── polls/                             # poll_service, flavor_poll_service, ranking_poll_service,
+    │                                       # rating_poll_service, special_instructions_poll_service,
+    │                                       # poll_history_service, poll_results_service
+    ├── reviews/review_service.py          # Review card
+    ├── reviews/review_scheduler.py        # Async scheduler for post-order reviews
+    ├── auction/auction_service.py         # Auction + auction-result DSL cards, auction creation helper
+    └── auction/auction_scheduler.py       # Async scheduler that closes due auctions and pays out the winner
 ```
+
+See [`CLAUDE.md`](./CLAUDE.md) for the full per-file breakdown.
 
 ## Setup
 
@@ -118,7 +123,7 @@ ITEM_ORDERABLE_OVERRIDES = {
 There's no chat command or admin UI to start an auction yet — call `create_and_send_auction()` directly (see `test.py` for a working example):
 
 ```python
-from bot.auction_service import create_and_send_auction
+from bot.auction.auction_service import create_and_send_auction
 
 await create_and_send_auction(
     room_id=ROOM_ID,
