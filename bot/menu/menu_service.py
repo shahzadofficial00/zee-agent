@@ -44,7 +44,7 @@ async def send_menu(room_id: str):
                         {
                             "id": str(i["id"]),
                             "name": i["name"],
-                            "price": i["price"],
+                            "price": str(i["price"]),
                             "image": i.get("image") or "",
                             "orderable": item_flags.get(i["name"].lower().strip(), True),
                         }
@@ -162,7 +162,7 @@ async def send_category_card(room_id: str, category_name: str):
                 {
                     "id": str(i["id"]),
                     "name": i["name"],
-                    "price": i["price"],
+                    "price": str(i["price"]),
                     "image": i.get("image") or "",
                 }
                 for i in matched

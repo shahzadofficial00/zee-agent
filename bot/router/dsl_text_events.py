@@ -1,5 +1,5 @@
 from bot.matrix_client import send_text
-from bot.router.state import last_orders, logger
+from bot.router.state import last_orders, order_flows, logger
 from bot.router.ids import generate_unique_tip_id
 from db import get_payment, update_payment_status, save_review
 
@@ -101,10 +101,83 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
         # NOT handled — falls through to the agent below
         return False, message
 
+    # ── fulfillment_selection — customer picked how to receive the order ─────
+    # Deterministic, no LLM: branch to whichever detail card the method needs.
+    if dsl_type == 'fulfillment_selection':
+        data = dsl.get('data', {})
+        method = data.get('method', '').strip().lower()
+        state = order_flows.get(sender)
+        if not state or state.get('stage') != 'fulfillment_method':
+            logger.info(f"⏭️ Skipping fulfillment_selection — no active fulfillment stage for {sender}")
+            return True, None
+        state['fulfillment_method'] = method
+        order_id = state.get('order_id', '')
+
+        if method in ('dine_in', 'pickup'):
+            state['stage'] = 'awaiting_name'
+            from bot.orders.fulfillment_service import send_name_request_card
+            await send_name_request_card(room_id, order_id, method)
+        elif method == 'car':
+            state['stage'] = 'awaiting_car'
+            from bot.orders.fulfillment_service import send_car_request_card
+            await send_car_request_card(room_id, order_id)
+        elif method == 'delivery':
+            state['stage'] = 'awaiting_address'
+            from bot.orders.fulfillment_service import send_address_request_card
+            await send_address_request_card(room_id, order_id)
+        else:
+            order_flows.pop(sender, None)
+            await send_text(room_id, "Sorry, I didn't recognize that — please try ordering again.")
+        return True, None
+
+    # ── name_response — dine-in/pickup name captured, ask final confirmation ──
+    if dsl_type == 'name_response':
+        data = dsl.get('data', {})
+        state = order_flows.get(sender)
+        if not state or state.get('stage') != 'awaiting_name':
+            logger.info(f"⏭️ Skipping name_response — not awaiting a name for {sender}")
+            return True, None
+        state['fulfillment_summary'] = data.get('name', '').strip()
+        state['stage'] = 'final_confirm'
+        from bot.router.order_flow import _send_final_confirm_poll
+        await _send_final_confirm_poll(sender, room_id)
+        return True, None
+
+    # ── car_response — vehicle details shared, ask final confirmation ────────
+    if dsl_type == 'car_response':
+        data = dsl.get('data', {})
+        state = order_flows.get(sender)
+        if not state or state.get('stage') != 'awaiting_car':
+            logger.info(f"⏭️ Skipping car_response — not awaiting car details for {sender}")
+            return True, None
+        summary = f"{data.get('color', '').strip()} {data.get('make', '').strip()} {data.get('model', '').strip()}".strip()
+        plate = data.get('plate_number', '').strip()
+        if plate:
+            summary = f"{summary} ({plate})".strip()
+        state['fulfillment_summary'] = summary
+        state['stage'] = 'final_confirm'
+        from bot.router.order_flow import _send_final_confirm_poll
+        await _send_final_confirm_poll(sender, room_id)
+        return True, None
+
+    # ── address_response — delivery address shared, ask final confirmation ───
+    if dsl_type == 'address_response':
+        data = dsl.get('data', {})
+        state = order_flows.get(sender)
+        if not state or state.get('stage') != 'awaiting_address':
+            logger.info(f"⏭️ Skipping address_response — not awaiting an address for {sender}")
+            return True, None
+        parts = [data.get('line1', '').strip(), data.get('line2', '').strip(), data.get('city', '').strip()]
+        state['fulfillment_summary'] = ", ".join(p for p in parts if p)
+        state['stage'] = 'final_confirm'
+        from bot.router.order_flow import _send_final_confirm_poll
+        await _send_final_confirm_poll(sender, room_id)
+        return True, None
+
     # ── bid_confirmation — customer placed/updated a bid on a live auction ──
     # Deterministic, no LLM: re-validate server-side (the client only checks
     # the amount locally) and record it as the customer's current bid.
-    elif dsl_type == 'bid_confirmation':
+    if dsl_type == 'bid_confirmation':
         from db import place_bid_if_higher
         data = dsl.get('data', {})
         auction_id = data.get('auction_id', '').strip()

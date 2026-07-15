@@ -145,9 +145,27 @@ async def _start_customer_info_stage(sender: str, room_id: str) -> None:
     await matrix_client.room_typing(room_id, typing_state=False)
 
 
+async def _start_fulfillment_stage(sender: str, room_id: str) -> None:
+    """Final Yes received — before actually placing the order, ask how the
+    customer wants to receive it (JNO-164/165). The stable order_id is
+    generated here (not later in agent_dispatch.py) so it's consistent across
+    every fulfillment card, the eventual receipt, and the payment intent."""
+    state = order_flows.get(sender)
+    if not state:
+        return
+    from bot.router.ids import generate_unique_order_id
+    state["order_id"] = await generate_unique_order_id()
+    state["stage"] = "fulfillment_method"
+    await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
+    from bot.orders.fulfillment_service import send_fulfillment_method_card
+    await send_fulfillment_method_card(room_id, state["order_id"])
+    await matrix_client.room_typing(room_id, typing_state=False)
+
+
 async def _place_deterministic_order(sender: str, room_id: str) -> None:
-    """Final Yes received — call confirm_order directly (no LLM in the loop) and
-    dispatch the resulting signal string through the normal card-sending path."""
+    """Fulfillment details collected (or skipped) — call confirm_order directly
+    (no LLM in the loop) and dispatch the resulting signal string through the
+    normal card-sending path."""
     state = order_flows.pop(sender, None)
     if not state:
         return
@@ -178,8 +196,16 @@ async def _place_deterministic_order(sender: str, room_id: str) -> None:
 
     fake_result = {"messages": [_FakeMessage(result_text)]}
 
+    fulfillment = None
+    if state.get("fulfillment_method"):
+        fulfillment = {
+            "method": state["fulfillment_method"],
+            "summary": state.get("fulfillment_summary", ""),
+            "order_id": state.get("order_id"),
+        }
+
     await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
-    clean_reply = await _dispatch_agent_result(fake_result, room_id, sender)
+    clean_reply = await _dispatch_agent_result(fake_result, room_id, sender, fulfillment=fulfillment)
     if sender not in conversation_histories:
         conversation_histories[sender] = []
     conversation_histories[sender].append({
@@ -241,10 +267,7 @@ async def _handle_order_flow_poll_answer(sender: str, room_id: str, question: st
         if answer.strip().lower() == "yes":
             state["customer_name"] = state["candidate_name"]
             state["customer_phone"] = state["candidate_phone"]
-            state["stage"] = "final_confirm"
-            await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
-            await _send_final_confirm_poll(sender, room_id)
-            await matrix_client.room_typing(room_id, typing_state=False)
+            await _start_fulfillment_stage(sender, room_id)
         else:
             state["stage"] = "await_name"
             await send_text(room_id, "No problem — what's your full name?")

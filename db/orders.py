@@ -27,6 +27,10 @@ def init_orders_schema(cur):
         cur.execute("ALTER TABLE orders ADD COLUMN line_items TEXT")
     if "sender" not in existing_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN sender TEXT")
+    if "fulfillment_method" not in existing_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN fulfillment_method TEXT")
+    if "fulfillment_summary" not in existing_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN fulfillment_summary TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reservations (
@@ -133,3 +137,29 @@ def update_order_stable_id(order_id: str, stable_order_id: str):
     conn.execute("UPDATE orders SET stable_order_id = ? WHERE id = ?", (stable_order_id, order_id))
     conn.commit()
     conn.close()
+
+
+def update_order_fulfillment(order_id: str, method: str, summary: str):
+    conn = _connect()
+    conn.execute(
+        "UPDATE orders SET fulfillment_method = ?, fulfillment_summary = ? WHERE id = ?",
+        (method, summary, order_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_order_by_stable_id(stable_order_id: str) -> dict | None:
+    """Resolve a human-readable order_id (ORD-XXXXXX) back to its room —
+    needed by the staff order_status trigger, which only ever knows the
+    order_id printed on the customer's receipt, not the room it came from."""
+    conn = _connect()
+    cur = conn.execute(
+        "SELECT id, customer_name, room_id, status FROM orders WHERE stable_order_id = ?",
+        (stable_order_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "customer_name": row[1], "room_id": row[2], "status": row[3]}

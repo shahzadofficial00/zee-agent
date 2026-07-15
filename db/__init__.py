@@ -3,6 +3,7 @@ from db.connection import _connect, _get_supabase, fuzzy_match_key, DB_PATH
 from db.orders import (
     init_orders_schema, save_order, save_reservation, order_id_exists,
     get_orders_by_room, update_order_room_id, update_order_stable_id,
+    update_order_fulfillment, get_order_by_stable_id,
 )
 from db.customers import init_customers_schema, get_customer, save_customer
 from db.menu import (

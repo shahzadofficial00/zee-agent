@@ -25,7 +25,7 @@ from bot.router.state import (
     conversation_histories, processed_event_ids, last_orders, pending_orders,
     order_flows, awaiting_reorder_confirmation,
 )
-from bot.router.order_flow import _start_order_flow, _send_final_confirm_poll, _handle_reorder_affirmation
+from bot.router.order_flow import _start_order_flow, _start_fulfillment_stage, _handle_reorder_affirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
 from bot.router.agent_dispatch import _dispatch_agent_result
 from bot.router.dsl_text_events import handle_dsl_text_event
@@ -81,9 +81,8 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
             flow_state["customer_phone"] = message.strip()
             from db import save_customer
             save_customer(sender, flow_state["customer_name"], flow_state["customer_phone"])
-            flow_state["stage"] = "final_confirm"
             await matrix_client.room_typing(room_id, typing_state=False)
-            await _send_final_confirm_poll(sender, room_id)
+            await _start_fulfillment_stage(sender, room_id)
         return
 
     # ── Sender just declined confirmation — check if this is their "same again?" reply ──

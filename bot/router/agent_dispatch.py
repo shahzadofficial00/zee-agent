@@ -10,9 +10,13 @@ from bot.router.ids import generate_unique_order_id
 # AGENT RESULT DISPATCH — parse signal strings out of the agent's messages,
 # send the matching DSL card/flow, and return cleaned reply text for history.
 # ─────────────────────────────────────────────────────────────────────────────
-async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
+async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment: dict | None = None) -> str:
     """Detect trigger markers in an agent result, dispatch the matching card/flow,
-    and return the cleaned reply text for conversation-history bookkeeping."""
+    and return the cleaned reply text for conversation-history bookkeeping.
+    `fulfillment` (only set by the deterministic order flow) carries the
+    {method, summary, order_id} collected via the fulfillment_method flow —
+    when present, the order gets the pre-generated order_id and an
+    order_confirmation v2 card instead of a freshly generated id + v1 card."""
     reply = ""
     if isinstance(result, dict) and "messages" in result:
         last    = result["messages"][-1]
@@ -277,11 +281,14 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
     if triggered_menu:
         await send_menu(room_id)
     elif triggered_payment:
-        # Order confirmed — generate a stable order id, persist it, send the
-        # receipt card, create the Swich payment intent, and schedule the review.
+        # Order confirmed — reuse the fulfillment flow's pre-generated order id
+        # if there is one (keeps every fulfillment card, the receipt, and the
+        # payment intent on the same id), otherwise generate a fresh one same
+        # as before. Persist it, send the receipt card, create the Swich
+        # payment intent, and schedule the review.
         if sender in pending_orders:
             del pending_orders[sender]
-        stable_order_id = await generate_unique_order_id()
+        stable_order_id = (fulfillment or {}).get("order_id") or await generate_unique_order_id()
         print(f"🔑 stable_order_id: {stable_order_id}")
         print(f"🔑 agent order_id: {triggered_payment['order_id']}")
         last_orders[sender] = {**triggered_payment, "order_id": stable_order_id, "room_id": room_id}
@@ -289,15 +296,29 @@ async def _dispatch_agent_result(result, room_id: str, sender: str) -> str:
         update_order_room_id(triggered_payment['order_id'], room_id)
         from db import update_order_stable_id
         update_order_stable_id(triggered_payment['order_id'], stable_order_id)
-        from bot.orders.order_confirmation_service import send_order_confirmation_card
-        await send_order_confirmation_card(
-            room_id=room_id,
-            line_items=triggered_payment.get("line_items", []),
-            total=triggered_payment["amount"],
-            customer_name=triggered_payment["name"],
-            order_id=stable_order_id,
-            user_id=sender,
-        )
+        if fulfillment:
+            from db import update_order_fulfillment
+            update_order_fulfillment(triggered_payment['order_id'], fulfillment["method"], fulfillment.get("summary", ""))
+            from bot.orders.order_confirmation_service import send_order_confirmation_card_v2
+            await send_order_confirmation_card_v2(
+                room_id=room_id,
+                line_items=triggered_payment.get("line_items", []),
+                total=triggered_payment["amount"],
+                customer_name=triggered_payment["name"],
+                order_id=stable_order_id,
+                user_id=sender,
+                fulfillment=fulfillment,
+            )
+        else:
+            from bot.orders.order_confirmation_service import send_order_confirmation_card
+            await send_order_confirmation_card(
+                room_id=room_id,
+                line_items=triggered_payment.get("line_items", []),
+                total=triggered_payment["amount"],
+                customer_name=triggered_payment["name"],
+                order_id=stable_order_id,
+                user_id=sender,
+            )
         from bot.payment.payment_service import create_payment_intent
         await create_payment_intent(
             room_id=room_id,

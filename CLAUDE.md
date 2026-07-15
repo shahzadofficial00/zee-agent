@@ -54,13 +54,17 @@ Restaurant Agent/
     │   ├── order_flow.py         # The deterministic per-item size/instructions/confirm checkout state machine
     │   ├── agent_invoke.py       # Agent retry wrapper (handles blank-generation retries)
     │   ├── agent_dispatch.py     # Parses tool signal strings out of agent output, dispatches the matching card
-    │   ├── dsl_text_events.py    # Inbound DSL-over-text handling: tip_selected/declined, order_summary, bid_confirmation, review_submit
+    │   ├── dsl_text_events.py    # Inbound DSL-over-text handling: tip_selected/declined, order_summary,
+    │   │                          # bid_confirmation, review_submit, fulfillment_selection/name_response/
+    │   │                          # car_response/address_response
     │   └── custom_events.py      # handle_custom_event: poll responses, review submit, legacy native polls
     ├── menu/
     │   └── menu_service.py      # Sends menu/item/category DSL cards
     ├── orders/
-    │   ├── order_confirmation_service.py  # Order receipt card
-    │   └── order_history_service.py       # Order history card
+    │   ├── order_confirmation_service.py  # Order receipt card (v1 + v2 with fulfillment summary)
+    │   ├── order_history_service.py       # Order history card
+    │   └── fulfillment_service.py         # fulfillment_method/name_request/car_request/address_request/
+    │                                       # order_status DSL senders + send_order_status_update() (staff trigger)
     ├── payment/
     │   ├── payment_service.py   # Swich gateway integration (orders AND tips)
     │   └── tip_service.py       # Sends the post-order tip_request card
@@ -104,11 +108,20 @@ message_handler.py
     │                          →  special-instructions poll (per item)
     │                          →  "reuse saved name/phone?" poll
     │                          →  (fresh name/phone via plain text, if declined/missing)
-    │                          →  final "Shall I proceed?" poll
+    │                          →  fulfillment_method card (Dine-in/Pickup/Car/Delivery)
+    │                          →  method detail card (name_request, or car/address_request
+    │                          │   → client-side saved-vehicle/address picker)
+    │                          →  final "Shall I proceed?" poll   [now the true last step]
     │                          →  confirm_order.invoke() called directly
-    │                          →  ORDER_SAVED → order_confirmation card + payment intent
+    │                          →  ORDER_SAVED → order_confirmation v2 card (with fulfillment
+    │                                            summary) + payment intent
     │                                         → rating poll(s)
     │                                         → tip_request card
+    │
+    ├── Order status (staff-triggered, NO LLM, NO chat exposure)
+    │   update_order_status.py <order_id> <status> → send_order_status_update()
+    │                          →  looks up the order's room (db.get_order_by_stable_id)
+    │                          →  order_status card (preparing/ready/on_the_way/delivered)
     │
     └── AI agent (free-form chat, reservations, menu Q&A, item ordering when the
         item list can't be parsed deterministically)
@@ -143,7 +156,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 **SQLite** (`restaurant.db`) — local, synchronous:
 | Table | Purpose |
 |---|---|
-| `orders` | Customer orders (name, phone, items, total, status, room_id, stable_order_id) |
+| `orders` | Customer orders (name, phone, items, total, status, room_id, stable_order_id, fulfillment_method, fulfillment_summary) |
 | `reservations` | Table bookings |
 | `menu_items` | Menu (local cache) |
 | `settings` | Key/value store (ordering_enabled flag) |
@@ -176,7 +189,8 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `menu` | v2 | Full menu grouped by category |
 | `menu_item` | v1 | Single item with image and price |
 | `menu_category` | v1 | All items in one category |
-| `order_confirmation` | v1 | Receipt card (before payment) |
+| `order_confirmation` | v1 | Receipt card (before payment) — no fulfillment info |
+| `order_confirmation` | v2 | Same receipt, plus an optional `fulfillment: {method, summary}` block. Additive-only; v1 stays registered/unmodified for in-flight messages that predate the fulfillment flow |
 | `payment` | v1 | Swich payment link card (orders and tips) |
 | `order_history` | v1 | List of past orders with payment status |
 | `review` | v1 | Post-order review prompt |
@@ -187,6 +201,15 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `tip_request` | v1 | Post-order tip prompt (presets, custom amount, decline) |
 | `auction` | v1 | Live auction card (image, starting price, min bid, countdown) |
 | `auction_result` | v1 | Inbound trigger is client-side (`bid_confirmation`); this outbound card is sent per-bidder when an auction closes — `is_winner` + a `Pay Now` button (via `order_id`) for the winner only |
+| `fulfillment_method` | v1 | 4-button picker (Dine-in/Pickup/Car/Delivery), sent right after customer info is settled |
+| `fulfillment_selection` | v1 | Inbound-only: customer's method choice |
+| `name_request` | v1 | Dine-in/Pickup name prompt |
+| `name_response` | v1 | Inbound-only: the name entered |
+| `car_request` | v1 | Opens the client's saved-vehicle picker/add sheet (reads/writes Supabase `vehicles`, client-owned — the agent never touches that table) |
+| `car_response` | v1 | Inbound-only: make/model/color/plate_number (+ optional label) shared |
+| `address_request` | v1 | Opens the client's saved-address picker/add sheet (reads/writes Supabase `addresses`, same client-owned pattern as `vehicles`) |
+| `address_response` | v1 | Inbound-only: line1/city (+ optional line2/notes/label) shared |
+| `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
 
 Incoming DSL events from the client are routed by `dsl.type`:
 - `review_submit` — saves customer review
@@ -194,7 +217,10 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `tip_selected` — customer picked a preset/custom tip amount → creates a real payment intent + sends a `payment` card (no LLM)
 - `tip_declined` — customer skipped the tip → plain text ack (no LLM)
 - `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
+- `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
+
+**Gotcha already hit and fixed:** `menu`/`menu_category`'s nested item `price` field must be a **string** (`str(i["price"])`), matching `menu_item_card_data`'s convention and what the Dart-generated model (`MenuV2Item.price: String`) expects — `send_menu()`/`send_category_card()` were sending the raw SQLite/Supabase numeric value, which passed Python-side schema validation (the nested `menu_item` def had no type constraint on `price`) but threw on the client's stricter generated parser, silently falling back to an "Unsupported" card. `schema.json` now explicitly types it `string` too, so `safe_send_dsl()` catches this class of bug server-side going forward.
 
 ---
 
@@ -279,6 +305,31 @@ After a successful order, `bot/payment/tip_service.py` automatically sends a `ti
 - **Decline** (`tip_declined`) → plain text acknowledgment, nothing else happens.
 
 No dedicated `tips` table exists yet — tip payments are just `payment_intents` rows distinguished by the `TIP-` prefix on `order_id`. If tip-specific reporting/analytics is ever needed, that's the natural next addition.
+
+---
+
+## Order Fulfillment
+
+After the customer confirms their name/phone, the deterministic order flow asks how they want to receive the order — **before** the final "Shall I proceed?" confirmation, not after, so the receipt shows the whole picture in one go and "Yes" is the true last step:
+
+1. `bot/router/order_flow.py::_start_fulfillment_stage()` generates the order's stable `order_id` **early** (not later in `agent_dispatch.py`, unlike the plain LLM-fallback path) and sends a `fulfillment_method` card
+2. Client responds `fulfillment_selection` (dine_in/pickup/car/delivery) → `bot/router/dsl_text_events.py` sends the matching detail card — `name_request` (dine-in/pickup), or `car_request`/`address_request` (car/delivery — these open the client's own saved-vehicle/address picker)
+3. Client responds `name_response`/`car_response`/`address_response` → the one-line `fulfillment_summary` is built server-side (e.g. `"White Toyota Corolla (ABC-123)"`, `"123 Main St, Apt 4, Lahore"`) and stashed on `order_flows[sender]`, then the **final** confirm poll fires
+4. "Yes" → `_place_deterministic_order()` → `agent_dispatch.py` reuses the pre-generated `order_id` (instead of minting a fresh one) and sends `order_confirmation` **v2** with the fulfillment block, plus `db.update_order_fulfillment()` persisting `fulfillment_method`/`fulfillment_summary` on the `orders` row
+
+**Saved addresses/vehicles are genuinely client-owned data** — Supabase `addresses`/`vehicles` tables, RLS-scoped to `auth.uid()`, written directly by the Flutter client's own "Add new" form. The agent never reads or writes those tables; it only ever receives the *result* via `car_response`/`address_response`. This is a deliberate, explicit exception to "the agent owns order data."
+
+### Order Status
+
+No admin UI exists yet — `update_order_status.py` is the trigger, run manually from a terminal, same "no chat exposure, no LLM" pattern as auction creation (see `test.py`):
+
+```bash
+python update_order_status.py ORD-AB12CD preparing
+python update_order_status.py ORD-AB12CD ready
+python update_order_status.py ORD-AB12CD delivered
+```
+
+Under the hood: `send_order_status_update(order_id, status, message)` (`bot/orders/fulfillment_service.py`) resolves `order_id → room_id` via `db.get_order_by_stable_id()` and sends the `order_status` card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, anything else falls back to a generic icon + title-cased label instead of an "unsupported DSL" card.
 
 ---
 
@@ -369,6 +420,8 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 - **stable_order_id** — a human-readable ID (`ORD-XXXXXX`, or `TIP-XXXXXX` for tips) separate from the SQLite auto-increment, used as the Supabase payment intent key.
 - **Fast-path bypass** — common intents (menu, pay, order history, cancel) are intercepted before the agent to reduce latency and LLM cost.
 - **DSL validation** — all outbound DSL payloads are validated against a JSON schema before sending to prevent malformed UI cards reaching clients. Inbound DSL (customer responses) is not schema-validated.
+- **Fulfillment before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details are already known, so the receipt reflects everything at once instead of the customer confirming before fulfillment even entered the picture.
+- **Manual CLI triggers over premature admin UI** — both `create_and_send_auction()` and `send_order_status_update()` are called directly (via `test.py`/`update_order_status.py`), not exposed to the LLM or gated behind a permission system that doesn't exist yet. A real staff surface can call the same functions later without touching the underlying logic.
 
 ---
 
@@ -384,3 +437,5 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 8. **No auction creation trigger** — `create_and_send_auction()` has to be called manually (see Auctions section); there's no chat command, Supabase-polling, or staff UI wired up yet. Deliberate scope cut, not an oversight.
 9. **No permission check on who can create an auction or place a bid** — same class of gap as #2, just unmitigated here (ordering_config's "hand-edited, restart-required" approach doesn't apply to auctions since creation is a runtime function call). Anyone who can call `create_and_send_auction()` or send a `bid_confirmation` DSL event can act.
 10. **Auction `payment_intents` reuse the winner's Matrix `user_id`/saved customer info** — same "no `tips` table"-style tradeoff as #6: fine for payment mechanics, no dedicated auction-analytics table if that's ever needed.
+11. **No order_status trigger UI** — `update_order_status.py` is a manually-run CLI script (same deliberate scope cut as auction creation, gap #8); a real staff dashboard is the natural next step if this goes into an actual restaurant, calling the same `send_order_status_update()` function underneath.
+12. **In-memory checkout state doesn't distinguish "mid-fulfillment" from any other in-progress stage** — a restart during `fulfillment_method`/`awaiting_name`/`awaiting_car`/`awaiting_address` loses that state exactly like every other `order_flows` stage (see gap #5); not a new gap, just confirming the fulfillment stages inherit the existing one.

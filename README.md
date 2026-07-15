@@ -9,8 +9,9 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 ## Features
 
 - Menu browsing (full menu, single item, category) as rich Matrix cards
-- Deterministic checkout flow — per-item size and special-instructions polls, saved-customer-info reuse, and final confirmation, all as real poll cards (not left to the LLM to decide)
-- Order placement with a payment card (Swich gateway) and receipt
+- Deterministic checkout flow — per-item size and special-instructions polls, saved-customer-info reuse, fulfillment method (Dine-in/Pickup/Car/Delivery) with saved-vehicle/address picker, and a final confirmation, all as real poll/DSL cards (not left to the LLM to decide)
+- Order placement with a payment card (Swich gateway) and a receipt that shows the chosen fulfillment details
+- Order status updates (Preparing/Ready/On the way/Delivered) pushed to the customer's chat, triggered by a staff CLI script
 - Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
 - Table reservations
@@ -50,8 +51,9 @@ Restaurant Agent/
     ├── menu/menu_service.py               # Sends menu/item/category DSL cards
     ├── payment/payment_service.py         # Swich gateway integration (orders and tips)
     ├── payment/tip_service.py             # Post-order tip request card
-    ├── orders/order_confirmation_service.py  # Order receipt card
+    ├── orders/order_confirmation_service.py  # Order receipt card (v1 + v2 with fulfillment summary)
     ├── orders/order_history_service.py       # Order history card
+    ├── orders/fulfillment_service.py         # Fulfillment method/detail cards + order_status trigger
     ├── polls/                             # poll_service, flavor_poll_service, ranking_poll_service,
     │                                       # rating_poll_service, special_instructions_poll_service,
     │                                       # poll_history_service, poll_results_service
@@ -135,6 +137,18 @@ await create_and_send_auction(
 ```
 
 Bids come in from the client as a `bid_confirmation` DSL event and are re-validated server-side (the app's own min-bid check is cosmetic only) — see `db.place_bid_if_higher()`. The `auction_scheduler.py` background task closes auctions past their deadline every 30s, picks the highest bidder, creates a real Swich payment intent for them, and sends every bidder a personalized result card. Winning amounts under Swich's 10 PKR minimum won't get a payment card.
+
+## Order Fulfillment & Status
+
+After checkout, the customer picks how they want the order — Dine-in/Pickup (name), Car or Delivery (saved-vehicle/address picker, client-owned Supabase data) — before the final confirmation, so the receipt shows the whole picture at once.
+
+There's no admin UI for order status yet either — push an update from a terminal:
+
+```bash
+python update_order_status.py ORD-AB12CD preparing
+python update_order_status.py ORD-AB12CD ready
+python update_order_status.py ORD-AB12CD delivered
+```
 
 ## Documentation
 
