@@ -3,6 +3,7 @@ from bot.matrix_client import matrix_client, send_text
 from bot.router.state import (
     order_flows, last_order_line, last_order_state,
     awaiting_reorder_confirmation, _REORDER_AFFIRMATIONS, conversation_histories,
+    ensure_history_loaded, persist_history,
 )
 from bot.router.agent_dispatch import _dispatch_agent_result
 
@@ -206,12 +207,12 @@ async def _place_deterministic_order(sender: str, room_id: str) -> None:
 
     await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
     clean_reply = await _dispatch_agent_result(fake_result, room_id, sender, fulfillment=fulfillment)
-    if sender not in conversation_histories:
-        conversation_histories[sender] = []
+    ensure_history_loaded(sender)
     conversation_histories[sender].append({
         "role": "assistant",
         "content": clean_reply or "Got it!"
     })
+    persist_history(sender)
 
     if "ORDER_SAVED" in result_text:
         from bot.payment.tip_service import send_tip_request_to_room

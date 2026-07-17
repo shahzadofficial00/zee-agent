@@ -27,6 +27,9 @@ from db.auctions import (
     get_open_auctions_past_end, mark_auction_closed, place_bid_if_higher,
     get_highest_bid, get_auction_bidders,
 )
+from db.conversation_history import (
+    init_conversation_history_schema, load_history, save_history,
+)
 
 
 # ─────────────────────────────────────────────
@@ -42,6 +45,7 @@ def init_db():
     init_menu_schema(cur)
     init_polls_schema(cur)
     init_auctions_schema(cur)
+    init_conversation_history_schema(cur)
 
     conn.commit()
     conn.close()

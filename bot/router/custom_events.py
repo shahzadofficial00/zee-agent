@@ -3,7 +3,7 @@ from nio import MatrixRoom, UnknownEvent
 from bot.matrix_client import matrix_client, BOT_START_TIME, send_text
 from bot.router.state import (
     processed_event_ids, conversation_histories, pending_orders,
-    poll_response_timers, logger,
+    poll_response_timers, logger, ensure_history_loaded, persist_history,
 )
 from bot.router.order_flow import _handle_order_flow_poll_answer, _handle_declined_confirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
@@ -99,8 +99,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
 
         # ── Every other DSL poll answer — feed it back into the agent as the ──
         # next turn in the conversation, replacing any stale answer to the same question ──
-        if sender not in conversation_histories:
-            conversation_histories[sender] = []
+        ensure_history_loaded(sender)
         conversation_histories[sender] = [
             m for m in conversation_histories[sender]
             if not isinstance(m.get("content"), str) or
@@ -110,9 +109,10 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
             "role": "user",
             "content": f"[Poll answer to \"{question}\"]: {selected_text}"
         })
+        persist_history(sender)
 
         messages = []
-        for msg in conversation_histories[sender][-12:]:
+        for msg in conversation_histories[sender][-20:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
 
         await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
@@ -123,6 +123,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
                 "role": "assistant",
                 "content": clean_reply or "Got it!"
             })
+            persist_history(sender)
         except asyncio.TimeoutError:
             await matrix_client.room_typing(room_id, typing_state=False)
             await send_text(room_id, "Sorry, that took too long! Please try again 🙏")
@@ -193,8 +194,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
             logger.error(f"❌ Failed to save poll answer: {e}", exc_info=True)
 
         # ── Feed the answer back into the agent as the next conversation turn ──
-        if sender not in conversation_histories:
-            conversation_histories[sender] = []
+        ensure_history_loaded(sender)
         conversation_histories[sender] = [
             m for m in conversation_histories[sender]
             if not m["content"].startswith(f"[Poll answer to \"{poll['question']}\"]")
@@ -203,10 +203,11 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
             "role": "user",
             "content": f"[Poll answer to \"{poll['question']}\"]: {selected_text}"
         })
+        persist_history(sender)
 
         async def _run_agent_for_poll_answer():
             messages = []
-            for msg in conversation_histories[sender][-12:]:
+            for msg in conversation_histories[sender][-20:]:
                 messages.append({"role": msg["role"], "content": msg["content"]})
             if sender in pending_orders:
                 messages.append({"role": "user", "content": f"[Reminder — order in progress: {pending_orders[sender]}]"})
@@ -219,6 +220,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
                     "role": "assistant",
                     "content": clean_reply or "Got it!"
                 })
+                persist_history(sender)
             except asyncio.TimeoutError:
                 await matrix_client.room_typing(room_id, typing_state=False)
                 await send_text(room_id, "Sorry, that took too long! Please try again 🙏")

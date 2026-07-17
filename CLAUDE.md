@@ -26,7 +26,8 @@ Restaurant Agent/
 │   ├── payments.py             # Supabase payment_intents CRUD
 │   ├── reviews.py               # Supabase reviews + review queue
 │   ├── polls.py                 # Polls, poll answers, item ratings
-│   └── auctions.py              # Auctions, bids, the locked-transaction bid logic
+│   ├── auctions.py              # Auctions, bids, the locked-transaction bid logic
+│   └── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -167,6 +168,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `item_ratings` | Post-order star ratings per item |
 | `auctions` | Auction metadata (title, starting_price, min_bid, ends_at, room_id, closed flag) |
 | `auction_bids` | One row per (auction_id, user_id) — a rebid updates the row in place rather than inserting a new one |
+| `conversation_history` | One row per user_id — their chat history as a JSON blob, so it survives a restart |
 
 **Supabase** — remote, async:
 | Table | Purpose |
@@ -220,6 +222,8 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
 
+**Item descriptions:** `menu` v2 / `menu_category` nested items and the `menu_item` card all carry a `description` string, sourced from the Supabase `menu_items.description` column. The Flutter grid card and item-detail screen read `item['description']` straight off the map (no generated model for nested items), so the schema tells you nothing about what the client renders there — check the Dart. Known gap: `_HighlightedItemCard` (the `menu_item` v1 card) takes `description` as a constructor param and never renders it, so that one card still shows nothing.
+
 **Gotcha already hit and fixed:** `menu`/`menu_category`'s nested item `price` field must be a **string** (`str(i["price"])`), matching `menu_item_card_data`'s convention and what the Dart-generated model (`MenuV2Item.price: String`) expects — `send_menu()`/`send_category_card()` were sending the raw SQLite/Supabase numeric value, which passed Python-side schema validation (the nested `menu_item` def had no type constraint on `price`) but threw on the client's stricter generated parser, silently falling back to an "Unsupported" card. `schema.json` now explicitly types it `string` too, so `safe_send_dsl()` catches this class of bug server-side going forward.
 
 ---
@@ -254,7 +258,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 
 ### Middleware Stack (in order)
 1. **`RestaurantGuardrail`** — blocks banned keywords (prompt-injection phrases) before the LLM; checks the customer's **latest** human message
-2. **`SummarizationMiddleware`** — summarizes conversation when it exceeds ~8000 tokens, keeps last 6 (rarely triggers in practice since `message_handler.py` already trims to the last 12 messages before invoking)
+2. **`SummarizationMiddleware`** — summarizes conversation when it exceeds ~8000 tokens, keeps last 6 (rarely triggers in practice since `message_handler.py` already trims to the last 20 messages before invoking)
 3. **`ToolRetryMiddleware`** — retries `confirm_order` / `confirm_reservation` up to 3 times
 4. **`PIIMiddleware`** — phone-number detector configured but currently a no-op (`strategy="none"`, `apply_to_input=False`, `apply_to_output=False`)
 5. **`ModelCallLimitMiddleware`** — caps a single `agent.ainvoke()` run at 10 model calls (`exit_behavior="end"`)
@@ -402,12 +406,13 @@ Startup sequence:
 
 ## Conversation History
 
-Per-user conversation history is kept in memory (`conversation_histories` dict):
-- Last 12 messages injected into each agent call
-- Capped at 20 messages per user
-- Lost on bot restart (no persistence)
+Per-user conversation history lives in the `conversation_histories` dict, write-through cached to the SQLite `conversation_history` table (`db/conversation_history.py`):
+- Last 20 messages injected into each agent call
+- Capped at 20 messages per user — the cap lives in `persist_history()` (`bot/router/state.py`), **not** at each call site: the poll paths in `custom_events.py`/`order_flow.py` append without capping, and persistence would turn that into an unbounded row on disk
+- **Survives a bot restart.** `ensure_history_loaded(sender)` reloads from SQLite on first touch per sender; `persist_history(sender)` must be called after every mutation
+- Writes are synchronous SQLite on the asyncio loop — one small blob per message, fine at this scale, revisit if it ever shows up in latency
 
-The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`) is **also** in-memory only, now living in `bot/router/state.py` (moved out of `message_handler.py` during the clean-architecture split, same dicts, same lifetime — see Project Structure). A bot restart mid-checkout currently loses that state — this is a known gap, not yet fixed (a write-through SQLite table for `order_flows` keyed by `user_id` is the planned fix, not yet implemented).
+The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`) is still **in-memory only**, living alongside the history dict in `bot/router/state.py`. A bot restart mid-checkout loses that state — a known gap, not yet fixed. Conversation history's `ensure_history_loaded`/`persist_history` pair is the working template for the planned fix (a write-through SQLite table for `order_flows` keyed by `user_id`), which is why history got done first.
 
 ---
 
@@ -431,7 +436,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 2. **No admin/staff permission check** anywhere — `ordering_config.py` mitigates this for ordering toggles (hand-edited, restart-required, no chat exposure), but is worth keeping in mind for any future admin-style feature. `HumanInTheLoopMiddleware` would be the right LangChain primitive if this becomes a priority.
 3. **`orders` table (SQLite) vs. `stable_order_id`** — confirm whether `update_order_room_id` / `update_order_stable_id` fully reconcile these now, or if older rows predate the random-ID scheme and still carry the old DB-generated ID.
 4. **Schema/DSL version drift** — any new DSL type or field needs simultaneous updates to the sender, `schema.json` (Python-validated outbound path only), and the Dart handler. DSL sent from Edge Functions bypasses Python's `safe_send_dsl()` entirely — no schema enforcement on that path.
-5. **In-memory checkout state doesn't survive a restart** — see Conversation History section above. Not yet fixed.
+5. **In-memory checkout state doesn't survive a restart** — `order_flows` and friends only; conversation history itself is now persisted (see Conversation History section above). Not yet fixed for checkout.
 6. **No dedicated `tips` table** — tip payments live in `payment_intents` distinguished only by the `TIP-` prefix; fine for the payment mechanics, not great for tip-specific reporting.
 7. **`poll_results` DSL's `results` breakdown array is only ever populated for rating polls** — the Flutter side already renders a generic percentage-bar breakdown for any poll type, but no Python service computes/sends that data for size/flavor/confirmation polls yet.
 8. **No auction creation trigger** — `create_and_send_auction()` has to be called manually (see Auctions section); there's no chat command, Supabase-polling, or staff UI wired up yet. Deliberate scope cut, not an oversight.

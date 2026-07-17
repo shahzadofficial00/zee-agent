@@ -5,25 +5,19 @@
 import asyncio
 import logging
 import langsmith as ls
-from nio import MatrixRoom, RoomMessageText, UnknownEvent
+from nio import MatrixRoom, RoomMessageText
 from bot.matrix_client import matrix_client, BOT_START_TIME, send_text
-from bot.menu.menu_service import send_menu, send_item_card , send_category_card
-from agent.agent import agent
-from agent.prompt import SYSTEM_PROMPT
-from agent.context import Context
-from bot.reviews.review_scheduler import schedule_review
+from bot.menu.menu_service import send_menu
 logger = logging.getLogger(__name__)
-from bot.payment.payment_service import send_payment_card
 import re as _re_pay
 import re as _re
-from db import get_pending_payment_by_user, save_order, save_reservation,  get_menu_items, get_payment, update_payment_status, save_review
-from db import update_order_room_id
+from db import get_pending_payment_by_user, update_payment_status
 
 # ── Extracted router pieces — deterministic order-flow state machine, agent ──
 # invocation/dispatch, and DSL/custom event routing all now live in bot/router/. ──
 from bot.router.state import (
     conversation_histories, processed_event_ids, last_orders, pending_orders,
-    order_flows, awaiting_reorder_confirmation,
+    order_flows, awaiting_reorder_confirmation, ensure_history_loaded, persist_history,
 )
 from bot.router.order_flow import _start_order_flow, _start_fulfillment_stage, _handle_reorder_affirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
@@ -166,8 +160,7 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
         # ── AI agent ──────────────────────────────────────────────────────────
         print(f"📨 [{room_id}] {sender}: {message}")
 
-        if sender not in conversation_histories:
-            conversation_histories[sender] = []
+        ensure_history_loaded(sender)
 
         # ── Inject pending order context into agent ───────────────────────────
         # Add context hint for very short messages so Gemini doesn't generate empty
@@ -177,7 +170,7 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
             user_content = message
 
         messages = []
-        for msg in conversation_histories[sender][-12:]:
+        for msg in conversation_histories[sender][-20:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
         if sender in pending_orders:
             messages.append({"role": "user", "content": f"[Reminder — order in progress: {pending_orders[sender]}]"})
@@ -204,8 +197,7 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
         conversation_histories[sender].append({"role": "user", "content": message})
         conversation_histories[sender].append({"role": "assistant", "content": clean_reply if clean_reply else "Got it!"})
 
-        if len(conversation_histories[sender]) > 20:
-            conversation_histories[sender] = conversation_histories[sender][-20:]
+        persist_history(sender)
 
     except Exception as e:
         # ── Catch-all: never let an unhandled exception go silent — show an outage banner ──

@@ -1,12 +1,14 @@
 import asyncio
 import logging
+from db import load_history, save_history
 
 # Same logger name/identity every other message_handler-derived module shared
 # before the split into bot/router/* — keeps log output unchanged.
 logger = logging.getLogger("bot.message_handler")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL STATE — all in-memory, reset on bot restart
+# MODULE-LEVEL STATE — in-memory and reset on bot restart, except
+# conversation_histories, which is write-through cached to SQLite (see bottom).
 # ─────────────────────────────────────────────────────────────────────────────
 conversation_histories: dict[str, list] = {}   # per-user chat history fed to the agent
 processed_event_ids: set[str] = set()          # dedupe guard against Matrix event replays
@@ -44,3 +46,25 @@ _REORDER_AFFIRMATIONS = {
     "same order", "keep it", "keep it the same", "go ahead", "please do",
     "yes please", "same please", "do it",
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONVERSATION HISTORY PERSISTENCE — write-through SQLite cache
+# ─────────────────────────────────────────────────────────────────────────────
+HISTORY_CAP = 20
+
+
+def ensure_history_loaded(sender: str) -> None:
+    """First touch per sender since restart: pull their history back from SQLite
+    instead of starting empty."""
+    if sender not in conversation_histories:
+        conversation_histories[sender] = load_history(sender)
+
+
+def persist_history(sender: str) -> None:
+    """Write-through so a restart doesn't lose this sender's history. Call after
+    every mutation. The cap lives here rather than at each call site: the poll
+    paths append without capping, and persistence turns that unbounded growth
+    into an unbounded row on disk."""
+    history = conversation_histories[sender][-HISTORY_CAP:]
+    conversation_histories[sender] = history
+    save_history(sender, history)

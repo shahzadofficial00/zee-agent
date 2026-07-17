@@ -41,7 +41,7 @@ async def get_menu_items():
         db = await _get_supabase()
         result = (
             await db.table("menu_items")
-            .select("id, name, price, image, category")
+            .select("id, name, price, image, category, description")
             .eq("available", True)
             .execute()
         )
