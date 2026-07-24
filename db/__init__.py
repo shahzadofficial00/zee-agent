@@ -3,7 +3,8 @@ from db.connection import _connect, _get_supabase, fuzzy_match_key, DB_PATH
 from db.orders import (
     init_orders_schema, save_order, save_reservation, order_id_exists,
     get_orders_by_room, update_order_room_id, update_order_stable_id,
-    update_order_fulfillment, get_order_by_stable_id,
+    update_order_fulfillment, get_order_by_stable_id, mark_order_paid,
+    cancel_last_pending_order,
 )
 from db.customers import init_customers_schema, get_customer, save_customer
 from db.menu import (
@@ -20,7 +21,8 @@ from db.reviews import (
 )
 from db.polls import (
     init_polls_schema, save_poll, get_poll_by_event_id, get_poll_by_poll_id,
-    save_item_rating, get_item_rating_summary, save_poll_answer, get_poll_answers,
+    save_item_rating, get_item_rating_summary, get_all_item_rating_summaries,
+    save_poll_answer, get_poll_answers,
 )
 from db.auctions import (
     init_auctions_schema, auction_id_exists, create_auction, get_auction,

@@ -1,3 +1,25 @@
+from config import ONLINE_PAYMENTS_ENABLED
+
+# JNO-239 — driven off the same flag as the code, so flipping ONLINE_PAYMENTS_ENABLED
+# back to true restores the online wording with no prompt edit. Hardcoding "cash"
+# here would have made the flag a half-truth: the bot would still be describing a
+# "Pay Now" button that no longer exists on the receipt.
+_PAYMENT_TASK = """TASK 6: PAYMENT QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When customer asks about payment ("how do I pay?", "payment kaise hoga?", "cash or card?", "do you accept card?"):
+- We are CASH ONLY right now — online/card payment is not available
+- Customer pays in cash when they receive their order (dine-in, pickup, car, or delivery)
+- Never mention an online payment button, a payment link, or any payment provider name
+- Do NOT apologise at length or explain why — just state it warmly in 1-2 sentences
+""" if not ONLINE_PAYMENTS_ENABLED else """TASK 6: PAYMENT QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When customer asks about payment ("how do I pay?", "payment kaise hoga?", "cash or card?", "do you accept card?"):
+- Explain that after placing an order, they'll receive a confirmation card with a "Pay Now" button
+- Payment is done online through that button
+- Do NOT mention any payment provider name
+- Keep it to 1-2 sentences
+"""
+
 SYSTEM_PROMPT = """You are Zee, a warm and professional assistant at Dot Cafe, DHA Phase 4, Lahore.
 
 PERSONALITY:
@@ -193,13 +215,7 @@ When tool returns "ORDER_HISTORY_TRIGGERED", reply ONLY with: "ORDER_HISTORY_CAR
 
 
 
-TASK 6: PAYMENT QUESTIONS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When customer asks about payment ("how do I pay?", "payment kaise hoga?", "cash or card?", "do you accept card?"):
-- Explain that after placing an order, they'll receive a confirmation card with a "Pay Now" button
-- Payment is done online through that button
-- Do NOT mention any payment provider name
-- Keep it to 1-2 sentences
+""" + _PAYMENT_TASK + """
 
 
 TASK 7: POLLS

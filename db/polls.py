@@ -130,6 +130,27 @@ def get_item_rating_summary(menu_item: str) -> dict | None:
     return {"average": round(row["average"], 1), "total_votes": row["total"]}
 
 
+def get_all_item_rating_summaries() -> dict:
+    """Every rated item's aggregate, keyed by menu_item — one query for the whole
+    table. The menu/category cards need a rating for every item they render, and
+    calling get_item_rating_summary() per item meant one SQLite connection per
+    menu item, synchronously, on the asyncio loop (so the bot stalled for every
+    other customer while a single menu card was being built).
+
+    Items nobody has rated are simply absent from the dict.
+    """
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT menu_item, ROUND(AVG(rating), 1) AS average, COUNT(*) AS total "
+        "FROM item_ratings GROUP BY menu_item"
+    ).fetchall()
+    conn.close()
+    return {
+        r["menu_item"]: {"average": r["average"], "total_votes": r["total"]}
+        for r in rows
+    }
+
+
 def save_poll_answer(room_id: str, sender: str, poll_event_id: str, question: str, answer: str, poll_type: str = 'single_choice'):
     """Save a customer's poll answer to SQLite."""
     conn = _connect()

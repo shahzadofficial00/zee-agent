@@ -10,6 +10,11 @@ Examples:
     python update_order_status.py ORD-AB12CD preparing
     python update_order_status.py ORD-AB12CD ready "Ready for pickup at the counter!"
     python update_order_status.py ORD-AB12CD delivered
+    python update_order_status.py ORD-AB12CD paid       # cash collected (JNO-240)
+
+'paid' is the only status written to the DB — it moves the order into the
+history page's "Completed" tab and unlocks Reorder. The lifecycle statuses just
+send a card.
 """
 import sys
 import asyncio

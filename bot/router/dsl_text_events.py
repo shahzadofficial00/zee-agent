@@ -60,6 +60,17 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
     # Deterministic, no LLM: create a payment intent for the tip amount
     # (same Swich flow as an order) and send the payment card.
     if dsl_type == 'tip_selected':
+        # JNO-241 — tip_request cards sent before the cash-only switch are still
+        # tappable in the customer's scrollback. Without this, send_payment_card()
+        # bails on the guarded (None, None) intent and the tap does nothing at all.
+        from config import ONLINE_PAYMENTS_ENABLED
+        if not ONLINE_PAYMENTS_ENABLED:
+            await send_text(room_id,
+                "💵 Thank you! We're cash-only right now — "
+                "feel free to tip in person when you get your order 🙏"
+            )
+            return True, None
+
         data = dsl.get('data', {})
         try:
             amount = int(float(data.get('amount', 0)))

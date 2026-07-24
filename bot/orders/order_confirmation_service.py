@@ -90,11 +90,18 @@ async def send_order_confirmation_card_v2(
     order_id: str,
     user_id: str,
     fulfillment: dict,
+    version: int = 2,
 ):
     """
     JNO-184/JNO-185 — same receipt card as v1, plus a `fulfillment` block
     ({method, summary}) the client renders as a _FulfillmentSummaryRow.
     v1 stays untouched/registered for in-flight messages predating this flow.
+
+    JNO-240 — `version=3` emits the identical payload as the cash receipt.
+    v3's handler renders a cash line instead of the gateway button and simply
+    ignores customer_name/user_id/raw_order_text, so no separate sender (or
+    schema def — the schema's order_confirmation branch has no `v`
+    discriminator) is needed for it.
     """
     menu_items = await get_menu_items()
     image_by_name = {m["name"].lower().strip(): (m.get("image") or "") for m in menu_items}
@@ -116,7 +123,7 @@ async def send_order_confirmation_card_v2(
     raw_order_text = ", ".join(reorder_parts)
 
     dsl = {
-        "v": 2,
+        "v": version,
         "type": "order_confirmation",
         "data": {
             "order_id": str(order_id),
@@ -128,12 +135,17 @@ async def send_order_confirmation_card_v2(
             "currency": "PKR",
             "raw_order_text": raw_order_text,
             "user_id": user_id,
-            "fulfillment": {
-                "method": fulfillment.get("method", ""),
-                "summary": fulfillment.get("summary", ""),
-            },
         },
     }
+
+    # Omit the block entirely rather than sending empty strings — a cash order
+    # (v3) can reach here without fulfillment, and both clients check for the
+    # key's presence, so `{"method": "", "summary": ""}` renders a blank row.
+    if fulfillment:
+        dsl["data"]["fulfillment"] = {
+            "method": fulfillment.get("method", ""),
+            "summary": fulfillment.get("summary", ""),
+        }
 
     if not safe_send_dsl(dsl):
         logger.error("❌ Order confirmation v2 DSL invalid, not sending")
@@ -151,6 +163,6 @@ async def send_order_confirmation_card_v2(
             message_type="m.room.message",
             content=content,
         )
-        logger.info(f"🧾 Order confirmation v2 card sent — {len(items_for_card)} items, total Rs {total}")
+        logger.info(f"🧾 Order confirmation v{version} card sent — {len(items_for_card)} items, total Rs {total}")
     except Exception as e:
         logger.error(f"❌ room_send failed: {e}", exc_info=True)

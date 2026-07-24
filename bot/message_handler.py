@@ -99,9 +99,45 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
 
     try:
         # ── Cancel order ──────────────────────────────────────────────────────
-        if 'cancel' in message.lower().strip():
+        # \bcancel\b, not a substring check — this branch now writes 'cancelled'
+        # into the orders table, so "what's your cancellation policy?" / "my last
+        # order was cancelled" must not reach it. Same word-boundary treatment
+        # the pay and order-history fast paths already get.
+        _CANCEL_INTENT_PATTERN = _re.compile(r'\bcancel\b', flags=_re.IGNORECASE)
+        if _CANCEL_INTENT_PATTERN.search(message):
             if sender in pending_orders:
                 del pending_orders[sender]
+
+            # JNO-239 — while cash-only there is no payment_intents row to cancel,
+            # so the Supabase lookup below can't see the order the customer means.
+            # Left unguarded it matched a stale pre-cash-only pending row for an
+            # OLDER order and replied "cancelled!" while the real one stood.
+            from config import ONLINE_PAYMENTS_ENABLED
+            if not ONLINE_PAYMENTS_ENABLED:
+                await matrix_client.room_typing(room_id, typing_state=False)
+                # Mid-checkout there's no orders row yet — drop the in-flight flow
+                # instead, or we'd cancel their previous (completed) order instead.
+                if order_flows.pop(sender, None):
+                    await send_text(room_id,
+                        "❌ Order cancelled!\nYou can place a new order anytime. 🍽️")
+                    return
+                from db import cancel_last_pending_order
+                cancelled_id = cancel_last_pending_order(sender, room_id)
+                if cancelled_id:
+                    last_orders.pop(sender, None)
+                    await send_text(room_id,
+                        f"❌ Order {cancelled_id} cancelled!\n"
+                        "You can place a new order anytime. 🍽️")
+                else:
+                    # Covers both "nothing pending" and "pending but past the
+                    # cancel window" — one message rather than a second query to
+                    # tell them apart, since the answer is the same either way.
+                    await send_text(room_id,
+                        "You don't have a recent order to cancel. "
+                        "If you need to change an order already with the kitchen, "
+                        "please give us a call. 📞")
+                return
+
             pending = await get_pending_payment_by_user(sender=sender, room_id=room_id)
             if pending:
                 await update_payment_status(
@@ -146,6 +182,16 @@ async def handle_message(room: MatrixRoom, event: RoomMessageText):
         )
         if _PAY_INTENT_PATTERN.search(message.lower().strip()):
             await matrix_client.room_typing(room_id, typing_state=False)
+            # JNO-239 — payment_intents rows created BEFORE the cash-only switch
+            # are still 'pending', so this path would happily resend a live Swich
+            # card for an old order. Answer with the cash message instead.
+            from config import ONLINE_PAYMENTS_ENABLED
+            if not ONLINE_PAYMENTS_ENABLED:
+                await send_text(room_id,
+                    "💵 We're taking cash payments only right now — "
+                    "just pay when you receive your order. No online payment needed!"
+                )
+                return
             pending = await get_pending_payment_by_user(sender=sender, room_id=room_id)
             if pending:
                 from bot.payment.payment_service import send_existing_payment_card

@@ -17,7 +17,8 @@ from db import init_db
 
 load_dotenv()
 import os
-print(f"🔧 .env check — REVIEW_CARD_ENABLED={os.getenv('REVIEW_CARD_ENABLED')!r} PAYMENT_CARD_ENABLED={os.getenv('PAYMENT_CARD_ENABLED')!r}")
+from config import ONLINE_PAYMENTS_ENABLED, TIPS_ENABLED
+print(f"🔧 .env check — REVIEW_CARD_ENABLED={os.getenv('REVIEW_CARD_ENABLED')!r} ONLINE_PAYMENTS_ENABLED={ONLINE_PAYMENTS_ENABLED} TIPS_ENABLED={TIPS_ENABLED}")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

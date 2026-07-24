@@ -13,7 +13,7 @@ async def generate_unique_order_id() -> str:
     from db import order_id_exists
     for _ in range(5):
         candidate = generate_order_id()
-        if not await order_id_exists(candidate):
+        if not order_id_exists(candidate):
             return candidate
     return generate_order_id() + secrets.choice(string.ascii_uppercase)
 
@@ -27,6 +27,6 @@ async def generate_unique_tip_id() -> str:
     from db import order_id_exists
     for _ in range(5):
         candidate = generate_tip_id()
-        if not await order_id_exists(candidate):
+        if not order_id_exists(candidate):
             return candidate
     return generate_tip_id() + secrets.choice(string.ascii_uppercase)

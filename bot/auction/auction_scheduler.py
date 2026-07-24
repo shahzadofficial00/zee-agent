@@ -42,7 +42,13 @@ async def run_auction_scheduler():
                                 user_id=bidder["user_id"],
                             )
                             if not tx_id:
-                                logger.error(f"❌ Payment intent creation failed for auction winner {bidder['user_id']}")
+                                # Cash-only mode guarantees a None here — that's
+                                # expected, not a failure worth paging anyone over.
+                                from config import ONLINE_PAYMENTS_ENABLED
+                                if ONLINE_PAYMENTS_ENABLED:
+                                    logger.error(f"❌ Payment intent creation failed for auction winner {bidder['user_id']}")
+                                else:
+                                    logger.info(f"💵 Cash-only mode — auction winner {bidder['user_id']} pays in person")
 
                     await send_auction_result_card(
                         room_id=bidder["room_id"],

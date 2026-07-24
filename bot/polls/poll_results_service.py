@@ -22,6 +22,10 @@ async def send_item_rating_results_to_room(matrix_client, room_id: str, menu_ite
             "menu_item": menu_item,
             "average_x10": round(average * 10),
             "total_votes": total_votes,
+            # The client's generated model does json["results"].map() unguarded,
+            # so a missing key throws and the card renders as "unsupported".
+            # A rating poll has no per-option breakdown — send an empty list.
+            "results": [],
         },
     }
 

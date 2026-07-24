@@ -2,10 +2,24 @@ import json
 import logging
 from bot.matrix_client import matrix_client
 from bot.dsl_validator import safe_send_dsl
-from db import get_menu_items
+from db import get_menu_items, get_all_item_rating_summaries
 from agent.state import update_menu_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _rating_fields(item_name: str, summaries: dict) -> dict:
+    """Aggregate stars for a menu card item. Empty dict when nobody's rated it
+    yet, so both fields are omitted (client shows no stars).
+
+    Takes the whole summaries dict rather than looking the item up itself — this
+    runs once per item in a card, and a per-item DB call meant one SQLite
+    connection per menu item on the asyncio loop. Callers fetch it once.
+    """
+    summary = summaries.get(item_name)
+    if not summary:
+        return {}
+    return {"rating": str(summary["average"]), "reviews": summary["total_votes"]}
 
 
 async def send_menu(room_id: str):
@@ -25,6 +39,7 @@ async def send_menu(room_id: str):
     from db import get_ordering_enabled, get_all_item_orderable
     ordering_enabled = get_ordering_enabled()
     item_flags = get_all_item_orderable()  # {item_name_lower: bool} — only disabled/explicit rows
+    ratings = get_all_item_rating_summaries()  # {item_name: {average, total_votes}}
 
     categories_map = {}
     for item in items:
@@ -48,6 +63,7 @@ async def send_menu(room_id: str):
                             "image": i.get("image") or "",
                             "description": i.get("description") or "",
                             "orderable": item_flags.get(i["name"].lower().strip(), True),
+                            **_rating_fields(i["name"], ratings),
                         }
                         for i in cat_items
                     ],
@@ -110,6 +126,9 @@ async def send_item_card(room_id: str, item_name: str):
             "price": str(target["price"]),
             "image": target.get("image") or "",
             "description": target.get("description") or "",
+            # One query for the whole table even though this card shows a single
+            # item — same single round-trip either way, and one code path.
+            **_rating_fields(target["name"], get_all_item_rating_summaries()),
         },
     }
 
@@ -154,6 +173,8 @@ async def send_category_card(room_id: str, category_name: str):
         )
         return
 
+    ratings = get_all_item_rating_summaries()
+
     dsl = {
         "v": 1,
         "type": "menu_category",
@@ -166,6 +187,7 @@ async def send_category_card(room_id: str, category_name: str):
                     "price": str(i["price"]),
                     "image": i.get("image") or "",
                     "description": i.get("description") or "",
+                    **_rating_fields(i["name"], ratings),
                 }
                 for i in matched
             ],

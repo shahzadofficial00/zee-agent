@@ -299,6 +299,24 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         if fulfillment:
             from db import update_order_fulfillment
             update_order_fulfillment(triggered_payment['order_id'], fulfillment["method"], fulfillment.get("summary", ""))
+
+        from config import ONLINE_PAYMENTS_ENABLED
+        if not ONLINE_PAYMENTS_ENABLED:
+            # JNO-240 — cash receipt. v3 handles a missing fulfillment block, so
+            # this branch covers the no-fulfillment case too and v1 is only ever
+            # reached when online payments are back on.
+            from bot.orders.order_confirmation_service import send_order_confirmation_card_v2
+            await send_order_confirmation_card_v2(
+                room_id=room_id,
+                line_items=triggered_payment.get("line_items", []),
+                total=triggered_payment["amount"],
+                customer_name=triggered_payment["name"],
+                order_id=stable_order_id,
+                user_id=sender,
+                fulfillment=fulfillment or {},
+                version=3,
+            )
+        elif fulfillment:
             from bot.orders.order_confirmation_service import send_order_confirmation_card_v2
             await send_order_confirmation_card_v2(
                 room_id=room_id,

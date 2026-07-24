@@ -74,5 +74,14 @@ async def send_order_status_update(order_id: str, status: str, message: str = ""
     if not order or not order.get("room_id"):
         logger.error(f"❌ send_order_status_update: no room found for order_id={order_id}")
         return False
+
+    # JNO-240 — 'paid' is the one status that outlives the card: it's what the
+    # history page filters on. The lifecycle statuses stay fire-and-forget so
+    # they can't overwrite it (orders.status is a single column).
+    if status == "paid":
+        from db import mark_order_paid
+        mark_order_paid(order_id)
+        logger.info(f"💵 Cash collected — order {order_id} marked paid")
+
     await send_order_status_card(order["room_id"], order_id, status, message)
     return True

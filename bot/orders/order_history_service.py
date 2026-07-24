@@ -12,6 +12,12 @@ async def send_order_history_card(room_id: str, sender: str = None):
     stable_ids = [o["stable_order_id"] for o in orders if o.get("stable_order_id")]
     payment_statuses = await get_payment_statuses(stable_ids)
 
+    # JNO-240 — a cash order has no payment_intents row, so the lookup misses and
+    # the row keeps its SQLite status: 'pending' until staff marks it paid via
+    # update_order_status.py, then 'paid'. Deliberately NOT a bespoke "cash"
+    # status: the Flutter history page filters on paid/pending/cancelled only, so
+    # anything else falls through every tab and the order vanishes from the UI.
+    # "Pending" is also just true — the customer hasn't handed over money yet.
     for o in orders:
         sid = o.get("stable_order_id")
         if sid and sid in payment_statuses:

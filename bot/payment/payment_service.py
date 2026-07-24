@@ -131,6 +131,14 @@ async def create_payment_intent(room_id, amount, customer_name, phone, order_id,
     order_confirmation "Pay Now" button has a row to find.
     Returns (transaction_id, payment_url).
     """
+    # JNO-239 — single chokepoint for every online payment path (orders, tips,
+    # auction winners). Guarding here instead of at the three call sites means
+    # no path can create a Swich transaction while we're cash-only.
+    from config import ONLINE_PAYMENTS_ENABLED
+    if not ONLINE_PAYMENTS_ENABLED:
+        logger.info(f"💵 Cash-only mode — skipping payment intent for order {order_id}")
+        return None, None
+
     if amount < 10:
         logger.error(f"❌ Refusing to create payment intent for invalid amount: {amount}")
         return None, None
@@ -211,6 +219,14 @@ async def send_existing_payment_card(
 ):
     """Resend the payment card for an already-existing pending intent.
     Does NOT create a new payment_intents row."""
+    # JNO-239 — this reads an existing row instead of creating one, so the guard
+    # in create_payment_intent() does NOT cover it. Rows that predate the
+    # cash-only switch are still 'pending' and would resend a live Swich card.
+    from config import ONLINE_PAYMENTS_ENABLED
+    if not ONLINE_PAYMENTS_ENABLED:
+        logger.info(f"💵 Cash-only mode — not resending payment card for {pending.get('order_id')}")
+        return
+
     dsl = {
         "v": 1,
         "type": "payment",

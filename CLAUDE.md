@@ -68,7 +68,7 @@ Restaurant Agent/
     │                                       # order_status DSL senders + send_order_status_update() (staff trigger)
     ├── payment/
     │   ├── payment_service.py   # Swich gateway integration (orders AND tips)
-    │   └── tip_service.py       # Sends the post-order tip_request card
+    │   └── tip_service.py       # Sends the post-order tip_request card (gated by TIPS_ENABLED)
     ├── polls/
     │   ├── poll_service.py      # Single-choice poll cards (size, Yes/No confirm, etc.)
     │   ├── flavor_poll_service.py  # Multi-select flavor preference poll
@@ -114,10 +114,12 @@ message_handler.py
     │                          │   → client-side saved-vehicle/address picker)
     │                          →  final "Shall I proceed?" poll   [now the true last step]
     │                          →  confirm_order.invoke() called directly
-    │                          →  ORDER_SAVED → order_confirmation v2 card (with fulfillment
-    │                                            summary) + payment intent
+    │                          →  ORDER_SAVED → order_confirmation card (with fulfillment
+    │                                            summary) — v3 while cash-only,
+    │                                            v2/v1 when ONLINE_PAYMENTS_ENABLED
+    │                                         → payment intent  [skipped while cash-only]
     │                                         → rating poll(s)
-    │                                         → tip_request card
+    │                                         → tip_request card [skipped unless TIPS_ENABLED]
     │
     ├── Order status (staff-triggered, NO LLM, NO chat exposure)
     │   update_order_status.py <order_id> <status> → send_order_status_update()
@@ -136,7 +138,8 @@ message_handler.py
                     ├── ITEM_TRIGGERED|name       → send_item_card()
                     ├── CATEGORY_TRIGGERED|name   → send_category_card()
                     ├── PAYMENT_TRIGGERED|...     → send_order_confirmation_card()
-                    │                               + create_payment_intent() + schedule_review()
+                    │                               + create_payment_intent()  [no-op while
+                    │                                 cash-only] + schedule_review()
                     ├── ORDER_HISTORY_TRIGGERED   → send_order_history_card()
                     ├── POLL_TRIGGERED|...        → send_single_choice_poll_to_room()
                     ├── MULTI_POLL_TRIGGERED|...  → send_flavor_preference_poll_to_room()
@@ -193,6 +196,7 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `menu_category` | v1 | All items in one category |
 | `order_confirmation` | v1 | Receipt card (before payment) — no fulfillment info |
 | `order_confirmation` | v2 | Same receipt, plus an optional `fulfillment: {method, summary}` block. Additive-only; v1 stays registered/unmodified for in-flight messages that predate the fulfillment flow |
+| `order_confirmation` | v3 | **The card actually sent today** (cash-only mode, JNO-240). Byte-identical payload to v2 — the client swaps the gateway button for a cash line and ignores `customer_name`/`user_id`/`raw_order_text`. One sender emits all three versions (`send_order_confirmation_card_v2(version=…)`); there is no separate v3 function or schema def |
 | `payment` | v1 | Swich payment link card (orders and tips) |
 | `order_history` | v1 | List of past orders with payment status |
 | `review` | v1 | Post-order review prompt |
@@ -225,6 +229,10 @@ Incoming DSL events from the client are routed by `dsl.type`:
 **Item descriptions:** `menu` v2 / `menu_category` nested items and the `menu_item` card all carry a `description` string, sourced from the Supabase `menu_items.description` column. The Flutter grid card and item-detail screen read `item['description']` straight off the map (no generated model for nested items), so the schema tells you nothing about what the client renders there — check the Dart. Known gap: `_HighlightedItemCard` (the `menu_item` v1 card) takes `description` as a constructor param and never renders it, so that one card still shows nothing.
 
 **Gotcha already hit and fixed:** `menu`/`menu_category`'s nested item `price` field must be a **string** (`str(i["price"])`), matching `menu_item_card_data`'s convention and what the Dart-generated model (`MenuV2Item.price: String`) expects — `send_menu()`/`send_category_card()` were sending the raw SQLite/Supabase numeric value, which passed Python-side schema validation (the nested `menu_item` def had no type constraint on `price`) but threw on the client's stricter generated parser, silently falling back to an "Unsupported" card. `schema.json` now explicitly types it `string` too, so `safe_send_dsl()` catches this class of bug server-side going forward.
+
+**Second instance of the same class — `poll_results` "unsupported" card:** the Python side validates against the *monolithic* `../dsl-spec/schemas/v1/schema.json`, where `poll_results_data.required` is only `["question", "poll_type"]`. The client validates against the *per-type* `poll_results.v1.json` in the app's own dsl-spec checkout, which lists `results` as required — its generated model does `json["results"].map(...)` unguarded, so a missing key throws, `_tryParse` swallows it, and the card renders as "Unsupported". Rating polls have no per-option breakdown, so `send_item_rating_results_to_room()` now sends `"results": []`. **The two schema copies are not the same file and can disagree** — a payload passing `safe_send_dsl()` proves nothing about the client's stricter generated parser. Real fix is upstream: drop `results` from `required` in `poll_results.v1.json` and regenerate (the Dart handler already does `msg.get<List>('results') ?? []`).
+
+**Adding any new DSL version — check the top-level `v` enum first:** `schema.json`'s root `v` property is an `enum`, not just `"type": "integer"`. It was `[1, 2]`, so the first `order_confirmation` v3 send was rejected by `safe_send_dsl()` before it left Python, with no per-type schema involved. Now `[1, 2, 3]`. A v4 of anything hits this again.
 
 ---
 
@@ -286,6 +294,13 @@ ITEM_ORDERABLE_OVERRIDES = {
 
 ## Payment (Swich Gateway)
 
+> **⚠️ CURRENTLY DISABLED — the bot is cash-only (JNO-239).** Everything in this
+> section describes the flow as it works when `ONLINE_PAYMENTS_ENABLED=true`.
+> With the flag off (today's default), `create_payment_intent()` returns
+> `(None, None)` before any Supabase or Swich call, so **no `payment_intents`
+> row is ever created** — for orders, tips, *or* auction winners. See
+> Cash-Only Mode below.
+
 **⚠️ This flow spans three codebases — Python bot, Flutter app, AND Deno/Supabase Edge Functions (separate repo). The Python bot has zero involvement past step 5.**
 
 Flow (orders):
@@ -300,11 +315,41 @@ Flow (orders):
 
 **Dead code, do not rely on it:** Flutter's `_sendPaymentSuccessEvent()` sends a custom `com.jaino.payment_success` event, and `bot/router/dsl_text_events.py` has a `dsl_type == 'payment_success'` branch — but the event Flutter sends isn't nested under `ai.jaeno.dsl`, so the branch never matches. This path has never fired in production. Safe to remove, or wire up properly if a fallback is ever wanted.
 
-Cancellation: any message containing "cancel" cancels the pending payment intent (Python-side only, doesn't touch the edge functions).
+Cancellation: a message matching `\bcancel\b` cancels the pending payment intent (Python-side only, doesn't touch the edge functions). While cash-only there is no payment intent, so it cancels the SQLite order instead — see Cash-Only Cancellation below.
+
+### Cash-Only Mode (JNO-238/239/240/241)
+
+Two flags in `config.py`, both read from `.env` **at import time — a change needs a bot restart**, and both defaulting to `false` so an unset env var can never silently re-enable real money movement:
+
+| Flag | Effect when `false` (today) |
+|---|---|
+| `ONLINE_PAYMENTS_ENABLED` | `create_payment_intent()` short-circuits to `(None, None)`; `agent_dispatch.py` sends `order_confirmation` **v3** (cash receipt, no gateway button); `order_history_service.py` reports cash orders as `status: "cash"` |
+| `TIPS_ENABLED` | `order_flow.py` skips the `tip_request` card entirely |
+
+**Why the guard lives inside `create_payment_intent()` and not at the call sites:** all three *creating* paths — orders (`agent_dispatch.py`), tips (`send_payment_card()`), and auction winner payouts (`auction_scheduler.py`) — funnel through that one function, and every caller already handled its `(None, None)` return.
+
+**There are TWO chokepoints, not one** — `send_existing_payment_card()` *reads* an existing row instead of creating one, so the `create_payment_intent()` guard does not cover it. This was missed on the first pass and shipped a real leak: `payment_intents` rows created **before** the flag flip are still `status='pending'`, so the "pay" keyword fast-path (`message_handler.py`) happily resent a live Swich card for a pre-cash-only order. Both `send_existing_payment_card()` and that fast path are now guarded — the fast path answers with the cash message instead of querying Supabase at all. **Any new code path that surfaces a payment must be checked against both.** The stale `pending` rows themselves are left alone; they're genuine historical online orders.
+
+The tip card is gated separately even though the guard already blocks tip payments: without it the customer taps a tip button that silently does nothing (`send_payment_card` returns early on the `None` transaction id).
+
+**Cash orders stay `'pending'` in order history until staff marks them paid** — `python update_order_status.py ORD-XXXXXX paid`. A bespoke `"cash"` status was tried first and reverted: the Flutter history page filters strictly on `paid`/`completed`/`delivered` → `pending` → `cancelled`, so any other string falls through **every** tab and the order disappears from the UI entirely (the page opens on "Completed", so the customer just sees "No orders found"). `'pending'` is also simply true — the customer hasn't handed over money yet.
+
+**Cash-Only Cancellation** — with no `payment_intents` row to cancel, "cancel" falls through to `db.cancel_last_pending_order()`, which flips the newest *recent* pending SQLite order to `'cancelled'`. Two bounds, both load-bearing, both covered by `test_cash_cancel.py`:
+
+- **`\bcancel\b`, not `'cancel' in message`** — this branch writes to the `orders` table now, not just a Supabase payment row, so the old substring test would have voided a real order on "what's your cancellation policy?" or "my last order was cancelled".
+- **`CANCEL_WINDOW_MINUTES = 15`** (`db/orders.py`) — nothing moves an order off `'pending'` except staff manually running `update_order_status.py ... paid`, so a delivered order whose cash was never marked collected is **indistinguishable in SQL** from one placed a minute ago. Unbounded, "cancel" days later would void a completed, paid-for sale. The window is the cheap stand-in for the lifecycle column that doesn't exist; if `preparing`/`delivered` ever persist durably, check those instead and drop the constant.
+
+Outside the window (or with nothing pending) the customer gets one "give us a call" message rather than a second query to tell the two cases apart — the answer is the same either way.
+
+`paid` is the **only** status persisted to `orders.status`; the lifecycle statuses (`preparing`/`ready`/`delivered`) remain fire-and-forget cards. `orders.status` is a single column holding the *payment* axis, so persisting lifecycle values there would let `delivered` overwrite `paid` and break the history filter. If both axes ever need persisting, that's a separate column, not a second string in this one.
+
+**The system prompt is flag-driven too** — `agent/prompt.py` picks its TASK 6 (PAYMENT QUESTIONS) text off `ONLINE_PAYMENTS_ENABLED`, so "how do I pay?" answers "cash on receipt" instead of describing a "Pay Now" button that isn't on the receipt any more. Hardcoding cash there would have made the flag a half-truth.
+
+**To restore online payments:** set both flags `true` in `.env` and restart. No code changes — v1/v2 senders, the tip handlers, and the Swich integration were all left intact, never removed.
 
 ### Tips
 
-After a successful order, `bot/payment/tip_service.py` automatically sends a `tip_request` card (presets `[50, 100, 200]` PKR + custom amount + decline option) — no LLM tool call, fired directly from `_place_deterministic_order` on `ORDER_SAVED`. When the customer responds:
+**(Disabled while cash-only — see above.)** After a successful order, `bot/payment/tip_service.py` automatically sends a `tip_request` card (presets `[50, 100, 200]` PKR + custom amount + decline option) — no LLM tool call, fired directly from `_place_deterministic_order` on `ORDER_SAVED`. When the customer responds:
 - **Preset/custom amount** (`tip_selected` DSL event) → `bot/router/dsl_text_events.py` looks up the customer's saved name/phone (`db.get_customer`), generates a `TIP-XXXXXX` id, and calls `payment_service.send_payment_card()` — the exact same function used for order payments — so the tip gets a real Swich checkout card. Rejects amounts under 10 PKR (Swich's minimum).
 - **Decline** (`tip_declined`) → plain text acknowledgment, nothing else happens.
 
@@ -380,7 +425,8 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 | `SWICH_SECRET_KEY` | Swich HMAC signing secret |
 | `BUSINESS_NAME` | Displayed on payment cards — ⚠️ there's a SEPARATE `BUSINESS_NAME` env var on the `swich-callback` Edge Function (different repo/secrets store). Not shared; can silently drift out of sync. |
 | `REVIEW_CARD_ENABLED` | `"true"` / `"false"` (default `"true"`) |
-| `PAYMENT_CARD_ENABLED` | Feature flag for payment card |
+| `ONLINE_PAYMENTS_ENABLED` | Master Swich kill switch — default `"false"`. See Cash-Only Mode |
+| `TIPS_ENABLED` | Post-order tip card on/off — default `"false"`. See Cash-Only Mode |
 | `LANGCHAIN_API_KEY` | LangSmith tracing key |
 
 ---
@@ -426,6 +472,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 - **Fast-path bypass** — common intents (menu, pay, order history, cancel) are intercepted before the agent to reduce latency and LLM cost.
 - **DSL validation** — all outbound DSL payloads are validated against a JSON schema before sending to prevent malformed UI cards reaching clients. Inbound DSL (customer responses) is not schema-validated.
 - **Fulfillment before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details are already known, so the receipt reflects everything at once instead of the customer confirming before fulfillment even entered the picture.
+- **Feature flags over code removal for the cash-only transition** — `ONLINE_PAYMENTS_ENABLED`/`TIPS_ENABLED` gate behavior; the Swich integration, tip handlers, and v1/v2 receipt senders all stay in the tree, untouched. Re-enabling is an `.env` edit plus a restart, not a revert. Both default to `false` on purpose: this gates real money movement, so a missing env var must fail closed.
 - **Manual CLI triggers over premature admin UI** — both `create_and_send_auction()` and `send_order_status_update()` are called directly (via `test.py`/`update_order_status.py`), not exposed to the LLM or gated behind a permission system that doesn't exist yet. A real staff surface can call the same functions later without touching the underlying logic.
 
 ---
@@ -444,3 +491,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 10. **Auction `payment_intents` reuse the winner's Matrix `user_id`/saved customer info** — same "no `tips` table"-style tradeoff as #6: fine for payment mechanics, no dedicated auction-analytics table if that's ever needed.
 11. **No order_status trigger UI** — `update_order_status.py` is a manually-run CLI script (same deliberate scope cut as auction creation, gap #8); a real staff dashboard is the natural next step if this goes into an actual restaurant, calling the same `send_order_status_update()` function underneath.
 12. **In-memory checkout state doesn't distinguish "mid-fulfillment" from any other in-progress stage** — a restart during `fulfillment_method`/`awaiting_name`/`awaiting_car`/`awaiting_address` loses that state exactly like every other `order_flows` stage (see gap #5); not a new gap, just confirming the fulfillment stages inherit the existing one.
+13. **Marking cash collected is a manual CLI step, and nothing reconciles it** — `update_order_status.py ORD-XXXXXX paid` is the only way an order leaves `'pending'` now that no gateway callback fires. Forget to run it and the order sits in the customer's "Pending" tab forever with no Reorder button. There's no till integration, no daily reconciliation, and no permission check on who can run it (gap #2).
+14. **JNO-238 (Cash as a *selectable* payment method) deliberately not built** — while `ONLINE_PAYMENTS_ENABLED=false` cash is the only option, so a picker with one choice is UI for a decision that can't be made. Build it when online payment returns and there are genuinely two options.
+15. **The Flutter history page silently swallows unknown statuses** — `_filtered` matches `paid`/`completed`/`delivered`, then `pending`, then `cancelled`, with no catch-all tab. Any status outside that set makes the order vanish from every filter rather than showing under a fallback. This already bit the `"cash"` attempt (see Cash-Only Mode); anything new written to `orders.status` must map onto one of those three buckets or the UI needs a fourth.
+16. **Auction winners get a dead "Pay Now" button while cash-only** — `auction_result`'s winner card renders a pay button off `order_id`, but no payment intent exists to back it, exactly like the `order_confirmation` receipt did before v3. Latent rather than live, since auctions have no creation trigger (gap #8), but it's the same unfixed shape.

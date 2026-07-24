@@ -82,21 +82,66 @@ async def save_reservation(name, phone, time, guests=1):
         raise
 
 
-async def order_id_exists(order_id: str) -> bool:
-    """Check if this order_id is already used in payment_intents (Supabase)."""
-    try:
-        db = await _get_supabase()
-        result = (
-            await db.table("payment_intents")
-            .select("order_id")
-            .eq("order_id", order_id)
-            .limit(1)
-            .execute()
-        )
-        return len(result.data) > 0
-    except Exception as e:
-        logger.error(f"order_id_exists failed: {e}")
-        return False
+def order_id_exists(order_id: str) -> bool:
+    """Check if this stable_order_id is already taken.
+
+    JNO-239 — this used to query Supabase payment_intents, which is write-frozen
+    while cash-only (create_payment_intent short-circuits), so it could never see
+    a cash order's id and the uniqueness check silently became a no-op plus a
+    blocking network round-trip mid-checkout. SQLite orders.stable_order_id is
+    the actual source of truth for these ids, and it's local + synchronous.
+    TIP-/AUC- ids still only live in payment_intents, so they get no collision
+    check here — acceptable at 36^6, and they'd need their own lookup anyway.
+    """
+    conn = _connect()
+    hit = conn.execute(
+        "SELECT 1 FROM orders WHERE stable_order_id = ? LIMIT 1", (order_id,)
+    ).fetchone()
+    conn.close()
+    return hit is not None
+
+# How recently an order must have been placed to still be self-cancellable.
+# ponytail: a fixed window, because while cash-only NOTHING moves an order off
+# 'pending' except staff running `update_order_status.py ... paid` — so a
+# delivered-but-unmarked order from last week looks identical to one placed a
+# minute ago, and an unbounded cancel would silently void it. Replace this with
+# a real lifecycle column (or a check against fulfillment state) if orders ever
+# record "preparing"/"delivered" durably.
+CANCEL_WINDOW_MINUTES = 15
+
+
+def cancel_last_pending_order(sender: str, room_id: str) -> str | None:
+    """Cancel this customer's most recent *recent* pending order in SQLite (JNO-239).
+
+    A cash order has NO payment_intents row, so the old Supabase-only cancel path
+    couldn't see it — and worse, would match a stale pre-cash-only pending row for
+    a DIFFERENT order and report "cancelled!" while the real order stood. Ordered
+    by id (autoincrement, strictly monotonic) rather than created_at, which ties.
+    Returns the cancelled stable_order_id, or None if there was nothing to cancel.
+
+    Only orders placed within CANCEL_WINDOW_MINUTES qualify — see the constant.
+    `created_at` is CURRENT_TIMESTAMP, which SQLite writes in UTC in the exact
+    same 'YYYY-MM-DD HH:MM:SS' format datetime('now') returns, so this is a plain
+    string comparison and needs no timezone handling.
+    """
+    conn = _connect()
+    row = conn.execute(
+        "SELECT stable_order_id FROM orders "
+        "WHERE sender = ? AND room_id = ? AND status = 'pending' "
+        f"AND created_at > datetime('now', '-{CANCEL_WINDOW_MINUTES} minutes') "
+        "ORDER BY id DESC LIMIT 1",
+        (sender, room_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    conn.execute(
+        "UPDATE orders SET status = 'cancelled' WHERE stable_order_id = ?", (row[0],)
+    )
+    conn.commit()
+    conn.close()
+    return row[0]
+
 
 def get_orders_by_room(room_id: str, sender: str = None) -> list:
     """Orders for a room, optionally scoped to one customer's Matrix sender id."""
@@ -137,6 +182,27 @@ def update_order_stable_id(order_id: str, stable_order_id: str):
     conn.execute("UPDATE orders SET stable_order_id = ? WHERE id = ?", (stable_order_id, order_id))
     conn.commit()
     conn.close()
+
+
+def mark_order_paid(stable_order_id: str) -> bool:
+    """Staff confirming cash was collected (JNO-240). Keyed on stable_order_id
+    because that's the only id staff ever see (ORD-XXXXXX), same as
+    get_order_by_stable_id. Returns False if no such order.
+
+    Only the PAYMENT axis is persisted here — the order_status lifecycle
+    (preparing/ready/delivered) deliberately stays fire-and-forget, because
+    orders.status is a single column and persisting both would have 'delivered'
+    overwrite 'paid', breaking the history card's paid/pending/cancelled filter.
+    """
+    conn = _connect()
+    cur = conn.execute(
+        "UPDATE orders SET status = 'paid' WHERE stable_order_id = ?",
+        (stable_order_id,),
+    )
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
 
 
 def update_order_fulfillment(order_id: str, method: str, summary: str):

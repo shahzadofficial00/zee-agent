@@ -215,8 +215,12 @@ async def _place_deterministic_order(sender: str, room_id: str) -> None:
     persist_history(sender)
 
     if "ORDER_SAVED" in result_text:
-        from bot.payment.tip_service import send_tip_request_to_room
-        await send_tip_request_to_room(matrix_client, room_id)
+        # JNO-241 — a tip card leads to a Swich checkout, which is blocked while
+        # cash-only. Don't show a button that can't complete.
+        from config import TIPS_ENABLED
+        if TIPS_ENABLED:
+            from bot.payment.tip_service import send_tip_request_to_room
+            await send_tip_request_to_room(matrix_client, room_id)
 
 
 async def _handle_order_flow_poll_answer(sender: str, room_id: str, question: str, answer: str) -> bool:

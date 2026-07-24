@@ -57,6 +57,10 @@ async def send_auction_card(room_id: str, auction: dict):
 async def send_auction_result_card(room_id: str, title: str, currency: str,
                                     winning_amount: float, is_winner: bool,
                                     order_id: str, user_id: str):
+    # JNO-239 — the client hangs the winner's "Pay Now" button off order_id, but
+    # create_payment_intent() returns None while cash-only, so there'd be no
+    # intent behind it. Same fix shape as the v3 receipt: drop the button.
+    from config import ONLINE_PAYMENTS_ENABLED
     dsl = {
         "v": 1,
         "type": "auction_result",
@@ -65,7 +69,7 @@ async def send_auction_result_card(room_id: str, title: str, currency: str,
             "currency": currency,
             "winning_amount": winning_amount,
             "is_winner": is_winner,
-            "order_id": order_id if is_winner else "",
+            "order_id": order_id if (is_winner and ONLINE_PAYMENTS_ENABLED) else "",
             "user_id": user_id,
         },
     }
