@@ -15,8 +15,10 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 
 ```
 Restaurant Agent/
-├── main.py                     # Entry point
+├── main.py                     # Entry point — login/session restore, auto-join, callbacks, schedulers
 ├── config.py                   # Matrix credentials, feature flags
+├── dsl-spec/schemas/v1/schema.json  # In-repo copy of the DSL schema (see DSL Protocol)
+├── store/                      # gitignored — E2EE olm keys (nio.db) + credentials.json
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
 │   ├── __init__.py             # Re-exports every function so `from db import X` keeps working; assembles init_db()
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
@@ -187,7 +189,7 @@ Orders are saved to SQLite first, then a `stable_order_id` (e.g. `ORD-AB1C2D`) i
 
 ## DSL Protocol
 
-All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.dsl` field. Payloads are validated against a JSON schema at `../dsl-spec/schemas/v1/schema.json` before sending — this only covers **outbound** sends (`safe_send_dsl()`); inbound DSL events from the client are not schema-validated.
+All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.dsl` field. Payloads are validated against a JSON schema at `dsl-spec/schemas/v1/schema.json` (in-repo since JNO-schema-move; was `../dsl-spec/`, an unversioned Desktop folder) before sending — this only covers **outbound** sends (`safe_send_dsl()`); inbound DSL events from the client are not schema-validated.
 
 | DSL type | Version | Description |
 |---|---|---|
@@ -230,7 +232,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 
 **Gotcha already hit and fixed:** `menu`/`menu_category`'s nested item `price` field must be a **string** (`str(i["price"])`), matching `menu_item_card_data`'s convention and what the Dart-generated model (`MenuV2Item.price: String`) expects — `send_menu()`/`send_category_card()` were sending the raw SQLite/Supabase numeric value, which passed Python-side schema validation (the nested `menu_item` def had no type constraint on `price`) but threw on the client's stricter generated parser, silently falling back to an "Unsupported" card. `schema.json` now explicitly types it `string` too, so `safe_send_dsl()` catches this class of bug server-side going forward.
 
-**Second instance of the same class — `poll_results` "unsupported" card:** the Python side validates against the *monolithic* `../dsl-spec/schemas/v1/schema.json`, where `poll_results_data.required` is only `["question", "poll_type"]`. The client validates against the *per-type* `poll_results.v1.json` in the app's own dsl-spec checkout, which lists `results` as required — its generated model does `json["results"].map(...)` unguarded, so a missing key throws, `_tryParse` swallows it, and the card renders as "Unsupported". Rating polls have no per-option breakdown, so `send_item_rating_results_to_room()` now sends `"results": []`. **The two schema copies are not the same file and can disagree** — a payload passing `safe_send_dsl()` proves nothing about the client's stricter generated parser. Real fix is upstream: drop `results` from `required` in `poll_results.v1.json` and regenerate (the Dart handler already does `msg.get<List>('results') ?? []`).
+**Second instance of the same class — `poll_results` "unsupported" card:** the Python side validates against the *monolithic* `dsl-spec/schemas/v1/schema.json`, where `poll_results_data.required` is only `["question", "poll_type"]`. The client validates against the *per-type* `poll_results.v1.json` in the app's own dsl-spec checkout, which lists `results` as required — its generated model does `json["results"].map(...)` unguarded, so a missing key throws, `_tryParse` swallows it, and the card renders as "Unsupported". Rating polls have no per-option breakdown, so `send_item_rating_results_to_room()` now sends `"results": []`. **The two schema copies are not the same file and can disagree** — a payload passing `safe_send_dsl()` proves nothing about the client's stricter generated parser. Real fix is upstream: drop `results` from `required` in `poll_results.v1.json` and regenerate (the Dart handler already does `msg.get<List>('results') ?? []`).
 
 **Adding any new DSL version — check the top-level `v` enum first:** `schema.json`'s root `v` property is an `enum`, not just `"type": "integer"`. It was `[1, 2]`, so the first `order_confirmation` v3 send was rejected by `safe_send_dsl()` before it left Python, with no per-type schema involved. Now `[1, 2, 3]`. A v4 of anything hits this again.
 
@@ -241,7 +243,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 ### LLM
 - **Model:** `gemini-2.5-flash`
 - **Temperature:** 0.4
-- **Rate limit:** 0.5 req/s (max bucket 5)
+- **Rate limit:** 2.0 req/s, max bucket 10 (`agent/llm.py`). Sized for a paid Tier 1 key (150–300 RPM); 2.0 rps = 120 RPM leaves ~20% headroom under the low end. The limiter counts requests *it* issues, not the SDK's internal retries, and one customer message costs 2–3 requests (model → tool → model) — so this is ~40–50 messages/min, not 120. Raise to 4.0 if AI Studio's quota page shows 300 RPM for the project.
 - **Reasoning:** disabled (`thinking_budget=0`)
 
 ### Tools
@@ -440,13 +442,40 @@ pip install -r requirements.txt   # (if requirements.txt exists)
 python main.py
 ```
 
+`python-olm` must be installed for encrypted rooms (see Matrix Client below). Without it the bot still runs, logs a warning, and cannot read or send in any encrypted room.
+
 Startup sequence:
 1. `init_db()` — creates SQLite tables if missing
-2. Matrix login + full sync
-3. Event callbacks registered
-4. Review scheduler started as background task
-5. Auction scheduler started as background task
-6. `sync_forever()` — main event loop
+2. `login()` — restores the saved session from `store/credentials.json` if present, otherwise a fresh password login that writes it; then `load_store()` for the olm keys
+3. Full sync
+4. Event callbacks registered — `auto_join` (invites), `handle_message` (text), `handle_custom_event` (unknown/DSL)
+5. Review scheduler started as background task
+6. Auction scheduler started as background task
+7. `sync_forever()` — main event loop
+
+---
+
+## Matrix Client, Encryption & Concurrency
+
+**E2EE (`bot/matrix_client.py`)** — nio enables encryption on its own whenever `python-olm` is importable; the client is configured with a `store_path` of `store/` so keys survive a restart. Two Windows-specific choices that are load-bearing:
+
+- **`store=SqliteStore`, not the default `DefaultStore`** — `DefaultStore` writes device-trust state to files named `<mxid>_<device>.blacklisted_devices`, and the `:` in a Matrix ID is an illegal Windows filename character → `WinError 123` on every encrypted send.
+- **`store_name="nio.db"`** — the default is `<mxid>_<device>.db`; on NTFS that same colon silently redirects the whole crypto DB into an **alternate data stream**, which vanishes the moment the folder is zipped or copied to Linux.
+
+**Session reuse (`main.py::login()`)** — the `user_id`/`device_id`/`access_token` are persisted to `store/credentials.json` and restored via `restore_login()`. A fresh `login()` each start would mint a new device with new olm keys, forcing every customer's client to re-share room keys with it.
+
+**Blanket device trust** — `matrix_client.room_send` is wrapped to default `ignore_unverified_devices=True`. Customers never verify a shop bot, and without it every send into an encrypted room raises `OlmUnverifiedDeviceError`. Patched at the client rather than per-sender because every DSL sender in the repo routes through `room_send`. Marked `ponytail:` in the source; the upgrade path is a real verification flow if anyone ever needs it.
+
+**Auto-join (`main.py::auto_join`)** — accepts DM invites from the app's Discovery → "Start chat" flow (3 retries), then greets. The greeting is deferred to `_greet_when_room_ready()`: the encrypted send path looks the room up in `client.rooms`, but a freshly joined room only appears after the *next* sync — and the callback fires mid-sync — so it waits on `client.synced` rather than sending immediately. Invite events repeat every sync until the join lands, hence the `_joining` set.
+
+**Per-sender concurrency (`bot/message_handler.py`)** — nio awaits event callbacks inline (`async_client.py::_on_event`), so handling work directly in the callback serializes *every* room behind the slowest turn: one 30s agent call stalls all other customers. `handle_message`/`handle_custom_event` are now thin wrappers that `_spawn()` a task per event:
+
+- **Serialized per sender** via `_sender_locks` — `order_flows` is a per-user state machine, so two events from the same user must not interleave. Text and custom (poll) events share one lock: a poll answer and a typed message drive the same flow.
+- **Exceptions are swallowed and logged** inside `_run_serialized` — previously an exception propagated out of the nio callback and killed `sync_forever` (the whole bot) for every user.
+- **Tasks are held in `_running_tasks`** — asyncio only keeps weak references, so an unheld task can be garbage-collected mid-flight.
+- **No automated check** — `test_concurrency.py` (asserted same-sender events don't interleave and different-sender ones do) was written and then deleted; nothing guards the serialization now.
+
+**SQLite under concurrency (`db/connection.py`)** — `timeout=30` (wait for the writer lock instead of raising "database is locked" the instant another handler is mid-write) and `PRAGMA journal_mode=WAL` (readers don't block on the writer). WAL leaves `restaurant.db-shm`/`-wal` sidecar files, both gitignored.
 
 ---
 
@@ -495,3 +524,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 14. **JNO-238 (Cash as a *selectable* payment method) deliberately not built** — while `ONLINE_PAYMENTS_ENABLED=false` cash is the only option, so a picker with one choice is UI for a decision that can't be made. Build it when online payment returns and there are genuinely two options.
 15. **The Flutter history page silently swallows unknown statuses** — `_filtered` matches `paid`/`completed`/`delivered`, then `pending`, then `cancelled`, with no catch-all tab. Any status outside that set makes the order vanish from every filter rather than showing under a fallback. This already bit the `"cash"` attempt (see Cash-Only Mode); anything new written to `orders.status` must map onto one of those three buckets or the UI needs a fourth.
 16. **Auction winners get a dead "Pay Now" button while cash-only** — `auction_result`'s winner card renders a pay button off `order_id`, but no payment intent exists to back it, exactly like the `order_confirmation` receipt did before v3. Latent rather than live, since auctions have no creation trigger (gap #8), but it's the same unfixed shape.
+17. **Every device is trusted, and every invite is accepted** — `ignore_unverified_devices=True` on all sends, and `auto_join` joins any room it's invited to with no allowlist. Both are deliberate (a shop bot nobody verifies, an app whose Discovery flow creates the DM), but they're the same unmitigated-permission class as gaps #2/#9.
+18. **`store/` is unbackuped local state that can't be regenerated** — delete it and the bot logs in as a *new* device, so every customer's client has to re-share room keys; history in encrypted rooms sent to the old device becomes unreadable. It's gitignored (it holds an access token), so nothing backs it up.
+19. **Per-sender locks and task set grow without bound** — `_sender_locks`/`_running_tasks` in `bot/message_handler.py` never evict a sender. One `asyncio.Lock` per customer forever; fine at a coffee shop's user count, would need eviction at scale.
+20. **The in-repo schema is now a second copy, not the source of truth** — `dsl-spec/` was an unversioned Desktop folder shared by hand with the Flutter app; copying it in fixed the "not in git" problem but made the drift in gap #4 concrete. Nothing checks the two copies against each other.

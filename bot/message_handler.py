@@ -23,13 +23,50 @@ from bot.router.order_flow import _start_order_flow, _start_fulfillment_stage, _
 from bot.router.agent_invoke import _invoke_agent_with_retry
 from bot.router.agent_dispatch import _dispatch_agent_result
 from bot.router.dsl_text_events import handle_dsl_text_event
-from bot.router.custom_events import handle_custom_event
+from bot.router.custom_events import handle_custom_event as _handle_custom_event
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONCURRENCY — nio awaits event callbacks inline (async_client.py::_on_event),
+# so doing the work here directly serializes every room behind the slowest turn:
+# one 30s agent call would stall all other customers. Each event gets its own
+# task, serialized per sender because order_flows is a per-user state machine and
+# two of that user's events must not interleave. Text and custom (poll) events
+# share one lock — a poll answer and a typed message drive the same flow.
+# ─────────────────────────────────────────────────────────────────────────────
+_sender_locks: dict[str, asyncio.Lock] = {}
+_running_tasks: set[asyncio.Task] = set()   # asyncio only holds weak refs to tasks
+
+
+async def _run_serialized(handler, room, event):
+    lock = _sender_locks.setdefault(event.sender, asyncio.Lock())
+    async with lock:
+        try:
+            await handler(room, event)
+        except Exception as e:
+            # Must not escape: an exception here used to propagate out of the nio
+            # callback and kill sync_forever (the whole bot) for every user.
+            logger.error(f"unhandled error handling {event.event_id}: {e}", exc_info=True)
+
+
+def _spawn(handler, room, event):
+    task = asyncio.create_task(_run_serialized(handler, room, event))
+    _running_tasks.add(task)
+    task.add_done_callback(_running_tasks.discard)
+
+
+async def handle_message(room: MatrixRoom, event: RoomMessageText):
+    _spawn(_handle_message, room, event)
+
+
+async def handle_custom_event(room: MatrixRoom, event):
+    _spawn(_handle_custom_event, room, event)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN MESSAGE HANDLER — routes every incoming RoomMessageText event
 # ─────────────────────────────────────────────────────────────────────────────
-async def handle_message(room: MatrixRoom, event: RoomMessageText):
+async def _handle_message(room: MatrixRoom, event: RoomMessageText):
     # ── Ignore messages from before bot start, from itself, or already processed ──
     if event.server_timestamp < BOT_START_TIME:
         return

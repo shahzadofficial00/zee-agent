@@ -19,13 +19,19 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Post-order review prompts on a delay
 - Per-customer name/phone memory across conversations
 - Live auctions — server-validated bidding (highest bid wins, no LLM involved), automatic close on deadline, winner gets a real Swich payment card
+- Works in end-to-end encrypted rooms, and auto-joins DM invites from the app's Discovery → "Start chat" flow with a greeting
+- Handles customers concurrently — one slow agent turn no longer blocks every other room
+
+> **Currently cash-only.** `ONLINE_PAYMENTS_ENABLED` and `TIPS_ENABLED` both default to `false`, so no Swich payment intent is created and no tip card is sent. Set both `true` in `.env` and restart to bring online payment back — no code changes. See CLAUDE.md → Cash-Only Mode.
 
 ## Project Structure
 
 ```
 Restaurant Agent/
-├── main.py                     # Entry point
+├── main.py                     # Entry point — login/session restore, auto-join, callbacks, schedulers
 ├── config.py                   # Matrix credentials, feature flags
+├── dsl-spec/schemas/v1/schema.json  # DSL schema used to validate every outbound card
+├── store/                      # gitignored — E2EE keys + saved session
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
 │   ├── orders.py / customers.py / menu.py / payments.py
@@ -73,6 +79,8 @@ venv\Scripts\activate
 pip install -r requirements.txt   # if requirements.txt exists
 ```
 
+`python-olm` is required for end-to-end encrypted rooms. Without it the bot still starts and logs a warning, but can't read or send in any encrypted room.
+
 Copy `.env.example` to `.env` and fill in the required values (see below), then run:
 
 ```bash
@@ -81,11 +89,16 @@ python main.py
 
 Startup sequence:
 1. `init_db()` — creates SQLite tables if missing
-2. Matrix login + full sync
-3. Event callbacks registered
-4. Review scheduler started as a background task
-5. Auction scheduler started as a background task
-6. `sync_forever()` — main event loop
+2. `login()` — restores the saved session from `store/credentials.json`, or logs in fresh and writes it, then loads the E2EE key store
+3. Full sync
+4. Event callbacks registered — invites (auto-join), text messages, DSL/custom events
+5. Review scheduler started as a background task
+6. Auction scheduler started as a background task
+7. `sync_forever()` — main event loop
+
+**Don't delete `store/`.** It holds the bot's device identity and olm keys; wiping it makes the bot log in as a brand-new device and every customer's client has to re-share room keys.
+
+Each incoming event is handled in its own task, serialized per sender (`bot/message_handler.py`) so one slow agent call can't block other customers while two events from the same customer still can't race the checkout state machine.
 
 ## Environment Variables (`.env`)
 
@@ -99,7 +112,8 @@ Startup sequence:
 | `SWICH_SECRET_KEY` | Swich HMAC signing secret |
 | `BUSINESS_NAME` | Displayed on payment cards |
 | `REVIEW_CARD_ENABLED` | `"true"` / `"false"` (default `"true"`) |
-| `PAYMENT_CARD_ENABLED` | Feature flag for payment card |
+| `ONLINE_PAYMENTS_ENABLED` | Master Swich kill switch — default `"false"` (cash-only) |
+| `TIPS_ENABLED` | Post-order tip card on/off — default `"false"` |
 | `LANGCHAIN_API_KEY` | LangSmith tracing key |
 
 ## Database

@@ -26,8 +26,12 @@ DB_PATH = "restaurant.db"
 # CONNECTION
 # ─────────────────────────────────────────────
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: wait for the writer lock instead of raising "database is locked"
+    # the instant another handler is mid-write. WAL: readers don't block on the
+    # writer, which matters now that message handling runs concurrently.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 

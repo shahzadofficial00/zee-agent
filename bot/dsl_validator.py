@@ -7,7 +7,7 @@ from jsonschema import validate, ValidationError
 logger = logging.getLogger(__name__)
 
 # Load schema once at startup
-_SCHEMA_PATH = Path(__file__).parent.parent.parent / "dsl-spec" / "schemas" / "v1" / "schema.json"
+_SCHEMA_PATH = Path(__file__).parent.parent / "dsl-spec" / "schemas" / "v1" / "schema.json"
 
 def _load_schema() -> dict:
     try:
