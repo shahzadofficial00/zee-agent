@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 async def send_single_choice_poll_to_room(
-    matrix_client, room_id: str, question: str, options: list[str]
+    matrix_client, room_id: str, question: str, options: list[str], chain_id: str | None = None
 ):
     print("🔵 SINGLE CHOICE POLL SERVICE CALLED")
     poll_id = uuid.uuid4().hex
@@ -26,6 +26,8 @@ async def send_single_choice_poll_to_room(
             "selected": None,
         },
     }
+    if chain_id:
+        dsl["data"]["chain_id"] = chain_id
 
     if not safe_send_dsl(dsl):
         logger.error("❌ Poll DSL invalid, not sending")

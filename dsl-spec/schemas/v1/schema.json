@@ -413,6 +413,7 @@
       "required": ["poll_id", "question", "poll_type"],
       "properties": {
         "poll_id":      { "type": "string" },
+        "chain_id":     { "type": "string" },
         "question":     { "type": "string" },
         "poll_type":    { 
           "type": "string", 

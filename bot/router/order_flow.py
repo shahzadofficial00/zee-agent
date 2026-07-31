@@ -60,6 +60,7 @@ async def _start_order_flow(sender: str, room_id: str, message: str) -> bool:
     if not parsed:
         return False
 
+    from bot.router.ids import generate_unique_order_id
     order_flows[sender] = {
         "distinct_items": [name for name, _ in parsed],
         "qtys": {name: qty for name, qty in parsed},
@@ -67,6 +68,7 @@ async def _start_order_flow(sender: str, room_id: str, message: str) -> bool:
         "index": 0,
         "sizes": {},
         "instructions": {},
+        "order_id": await generate_unique_order_id(),
     }
 
     item_list_text = ", ".join(f"{name} x{qty}" for name, qty in parsed)
@@ -84,7 +86,8 @@ async def _send_next_order_flow_poll(sender: str, room_id: str) -> None:
     if state["stage"] == "size":
         from bot.polls.poll_service import send_single_choice_poll_to_room
         await send_single_choice_poll_to_room(
-            matrix_client, room_id, f"What size would you like for {item}?", ["Small", "Medium", "Large"]
+            matrix_client, room_id, f"What size would you like for {item}?", ["Small", "Medium", "Large"],
+            chain_id=state["order_id"],
         )
     elif state["stage"] == "instructions":
         from bot.polls.special_instructions_poll_service import send_special_instructions_poll_to_room
@@ -92,6 +95,7 @@ async def _send_next_order_flow_poll(sender: str, room_id: str) -> None:
             matrix_client, room_id,
             placeholder="e.g. extra hot, less sugar, no ice",
             question=f"Any special instructions for your {item}?",
+            chain_id=state["order_id"],
         )
 
 
@@ -139,6 +143,7 @@ async def _start_customer_info_stage(sender: str, room_id: str) -> None:
             matrix_client, room_id,
             f"Should I use {customer['name']}, {customer['phone']} as before?",
             ["Yes", "No"],
+            chain_id=state["order_id"],
         )
     else:
         state["stage"] = "await_name"
@@ -154,8 +159,9 @@ async def _start_fulfillment_stage(sender: str, room_id: str) -> None:
     state = order_flows.get(sender)
     if not state:
         return
-    from bot.router.ids import generate_unique_order_id
-    state["order_id"] = await generate_unique_order_id()
+    if not state.get("order_id"):
+        from bot.router.ids import generate_unique_order_id
+        state["order_id"] = await generate_unique_order_id()
     state["stage"] = "fulfillment_method"
     await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
     from bot.orders.fulfillment_service import send_fulfillment_method_card
@@ -327,6 +333,7 @@ async def _handle_reorder_affirmation(sender: str, room_id: str, message: str) -
 
     # Rebuild order_flows straight at the customer-info stage — size and
     # instructions are already known, so re-derive nothing via the LLM.
+    from bot.router.ids import generate_unique_order_id
     order_flows[sender] = {
         "distinct_items": list(saved_state["distinct_items"]),
         "qtys": dict(saved_state["qtys"]),
@@ -334,6 +341,7 @@ async def _handle_reorder_affirmation(sender: str, room_id: str, message: str) -
         "instructions": dict(saved_state["instructions"]),
         "stage": "size",
         "index": len(saved_state["distinct_items"]),
+        "order_id": await generate_unique_order_id(),
     }
     await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
     await _start_customer_info_stage(sender, room_id)

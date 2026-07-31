@@ -12,6 +12,7 @@ async def send_special_instructions_poll_to_room(
     matrix_client, room_id: str,
     placeholder: str = "e.g. extra hot, less sugar",
     question: str = DEFAULT_QUESTION,
+    chain_id: str | None = None,
 ):
     print("📝 SPECIAL INSTRUCTIONS POLL SERVICE CALLED")
     poll_id = uuid.uuid4().hex
@@ -29,6 +30,8 @@ async def send_special_instructions_poll_to_room(
             "selected": None,
         },
     }
+    if chain_id:
+        dsl["data"]["chain_id"] = chain_id
     # ... rest unchanged
 
     if not safe_send_dsl(dsl):
