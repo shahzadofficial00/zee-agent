@@ -75,7 +75,7 @@ Restaurant Agent/
     │   ├── poll_service.py      # Single-choice poll cards (size, Yes/No confirm, etc.)
     │   ├── flavor_poll_service.py  # Multi-select flavor preference poll
     │   ├── ranking_poll_service.py # Drag-to-reorder poll
-    │   ├── rating_poll_service.py  # Post-order star rating poll (per item)
+    │   ├── rating_poll_service.py  # Post-order star rating poll (per item, chained)
     │   ├── special_instructions_poll_service.py  # Free-text "special instructions" poll
     │   ├── poll_history_service.py # "Show my poll history" card
     │   └── poll_results_service.py # Aggregate results follow-up card (currently rating only)
@@ -120,7 +120,7 @@ message_handler.py
     │                                            summary) — v3 while cash-only,
     │                                            v2/v1 when ONLINE_PAYMENTS_ENABLED
     │                                         → payment intent  [skipped while cash-only]
-    │                                         → rating poll(s)
+    │                                         → rating poll(s) — N events, one card
     │                                         → tip_request card [skipped unless TIPS_ENABLED]
     │
     ├── Order status (staff-triggered, NO LLM, NO chat exposure)
@@ -147,7 +147,8 @@ message_handler.py
                     ├── MULTI_POLL_TRIGGERED|...  → send_flavor_preference_poll_to_room()
                     ├── RANKING_POLL_TRIGGERED|.. → send_ranking_poll_to_room()
                     ├── OPEN_POLL_TRIGGERED|...   → send_special_instructions_poll_to_room()
-                    ├── RATING_POLL_TRIGGERED|... → send_rating_poll_to_room() (one card per item)
+                    ├── RATING_POLL_TRIGGERED|... → send_rating_poll_to_room() (one event per
+                    │                               item, one shared chain_id → ONE card)
                     └── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
 ```
 
@@ -227,6 +228,16 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
 - `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
+
+**Poll chaining (`chain_id`):** any `poll` card can carry an optional `data.chain_id`. Every poll sharing a value is drawn client-side as **one** card that advances question-to-question in place, instead of N stacked cards; the folded-in events are hidden as tiles. Omit it for a standalone question (a confirmation) so it keeps its own card. Used by:
+
+| Sender | chain_id |
+|---|---|
+| size / instructions / name-confirm (`order_flow.py`) | the order's `order_id` |
+| rating polls (`agent_dispatch.py`) | `rate_{order_id}` — **deliberately not the bare `order_id`** |
+| `send_single_choice_poll` / `send_special_instructions_poll` (LLM path) | whatever the model passes; `agent/prompt.py` documents the rule |
+
+**The client no longer requires the previous question to be answered before folding.** That condition was dropped app-side (`poll_chain.dart`) so the bot can fire a whole batch at once and forget it — which is what the rating polls do at `ORDER_SAVED`, rather than sequencing sends against inbound `poll_response` events (in-memory state that wouldn't survive a restart, gap #5). Consequence: **a chain_id collision now silently merges unrelated cards.** Ratings use the `rate_` prefix precisely so they don't land in the finished checkout chain. Any new chained sender needs its own namespace.
 
 **Item descriptions:** `menu` v2 / `menu_category` nested items and the `menu_item` card all carry a `description` string, sourced from the Supabase `menu_items.description` column. The Flutter grid card and item-detail screen read `item['description']` straight off the map (no generated model for nested items), so the schema tells you nothing about what the client renders there — check the Dart. Known gap: `_HighlightedItemCard` (the `menu_item` v1 card) takes `description` as a constructor param and never renders it, so that one card still shows nothing.
 
@@ -363,7 +374,7 @@ No dedicated `tips` table exists yet — tip payments are just `payment_intents`
 
 After the customer confirms their name/phone, the deterministic order flow asks how they want to receive the order — **before** the final "Shall I proceed?" confirmation, not after, so the receipt shows the whole picture in one go and "Yes" is the true last step:
 
-1. `bot/router/order_flow.py::_start_fulfillment_stage()` generates the order's stable `order_id` **early** (not later in `agent_dispatch.py`, unlike the plain LLM-fallback path) and sends a `fulfillment_method` card
+1. `bot/router/order_flow.py::_start_fulfillment_stage()` sends a `fulfillment_method` card carrying the order's stable `order_id`. That id is minted **when the flow starts**, not later in `agent_dispatch.py` as the plain LLM-fallback path does — the size/instructions polls already need it as their `chain_id`. `_start_fulfillment_stage()` keeps a defensive backfill for a flow that somehow arrives without one
 2. Client responds `fulfillment_selection` (dine_in/pickup/car/delivery) → `bot/router/dsl_text_events.py` sends the matching detail card — `name_request` (dine-in/pickup), or `car_request`/`address_request` (car/delivery — these open the client's own saved-vehicle/address picker)
 3. Client responds `name_response`/`car_response`/`address_response` → the one-line `fulfillment_summary` is built server-side (e.g. `"White Toyota Corolla (ABC-123)"`, `"123 Main St, Apt 4, Lahore"`) and stashed on `order_flows[sender]`, then the **final** confirm poll fires
 4. "Yes" → `_place_deterministic_order()` → `agent_dispatch.py` reuses the pre-generated `order_id` (instead of minting a fresh one) and sends `order_confirmation` **v2** with the fulfillment block, plus `db.update_order_fulfillment()` persisting `fulfillment_method`/`fulfillment_summary` on the `orders` row
@@ -498,6 +509,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 - **Split DB** — orders/reservations in SQLite (always available, no network), payments/reviews in Supabase (need real-time access from mobile clients).
 - **Domain-grouped packages over flat directories** — `bot/`, `agent/tools/`, and `db.py` were reorganized (this session) into subfolders/files per domain (polls, menu, orders, payment, reviews, auction) instead of one flat pile of same-level files. Every move was a pure relocation — function bodies copied verbatim, cross-references rewired, public import surface (`from db import X`, `from bot.message_handler import handle_message`, etc.) kept unchanged — verified by actually importing every module afterward, not just checking syntax.
 - **stable_order_id** — a human-readable ID (`ORD-XXXXXX`, or `TIP-XXXXXX` for tips) separate from the SQLite auto-increment, used as the Supabase payment intent key.
+- **Poll chaining is fire-and-forget, enforced client-side** — the bot sends all N chained polls at once and never tracks which have been answered. The alternative (send one, wait for its `poll_response`, send the next) is another per-user state machine in `order_flows`, which is in-memory only and would strand a customer mid-ratings on any restart. The cost is that collision-avoidance is now pure convention — see gap #21.
 - **Fast-path bypass** — common intents (menu, pay, order history, cancel) are intercepted before the agent to reduce latency and LLM cost.
 - **DSL validation** — all outbound DSL payloads are validated against a JSON schema before sending to prevent malformed UI cards reaching clients. Inbound DSL (customer responses) is not schema-validated.
 - **Fulfillment before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details are already known, so the receipt reflects everything at once instead of the customer confirming before fulfillment even entered the picture.
@@ -528,3 +540,4 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 18. **`store/` is unbackuped local state that can't be regenerated** — delete it and the bot logs in as a *new* device, so every customer's client has to re-share room keys; history in encrypted rooms sent to the old device becomes unreadable. It's gitignored (it holds an access token), so nothing backs it up.
 19. **Per-sender locks and task set grow without bound** — `_sender_locks`/`_running_tasks` in `bot/message_handler.py` never evict a sender. One `asyncio.Lock` per customer forever; fine at a coffee shop's user count, would need eviction at scale.
 20. **The in-repo schema is now a second copy, not the source of truth** — `dsl-spec/` was an unversioned Desktop folder shared by hand with the Flutter app; copying it in fixed the "not in git" problem but made the drift in gap #4 concrete. Nothing checks the two copies against each other.
+21. **Nothing guards against a `chain_id` collision** — since the client dropped its "previous question already answered" check, two senders picking the same value silently merge into one card, with no warning on either side. Only convention (the `rate_` prefix on rating polls) keeps them out of the checkout chain. See DSL Protocol → Poll chaining.

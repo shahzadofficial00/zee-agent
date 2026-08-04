@@ -15,7 +15,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
 - Table reservations
-- Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards
+- Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards — related questions share a `chain_id` so a multi-item order asks for its sizes, instructions and ratings in **one** card that advances in place, not a stack of them
 - Post-order review prompts on a delay
 - Per-customer name/phone memory across conversations
 - Live auctions — server-validated bidding (highest bid wins, no LLM involved), automatic close on deadline, winner gets a real Swich payment card

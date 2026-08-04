@@ -1,5 +1,6 @@
 import re as _re
 import asyncio
+import uuid as _uuid
 from bot.matrix_client import matrix_client, send_text
 from bot.menu.menu_service import send_menu, send_item_card, send_category_card
 from bot.reviews.review_scheduler import schedule_review
@@ -424,12 +425,14 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         await send_text(room_id, reply)
 
     # ── Rating poll can fire alongside another trigger (e.g. right after payment) ──
-    # One card per distinct item ordered, sent one after another.
+    # One event per distinct item, all sharing a chain_id so the client draws them
+    # as ONE card that advances item-to-item instead of N stacked cards.
     if triggered_rating_poll:
         from bot.polls.rating_poll_service import send_rating_poll_to_room
         item_names = triggered_rating_poll["item_names"]
+        chain_id = f"rate_{last_orders.get(sender, {}).get('order_id') or _uuid.uuid4().hex[:8]}"
         for item_name in item_names:
-            await send_rating_poll_to_room(matrix_client, room_id, item_name)
+            await send_rating_poll_to_room(matrix_client, room_id, item_name, chain_id=chain_id)
         if not clean_reply:
             clean_reply = f"[Rating poll(s) sent for: {', '.join(item_names)}]"
 

@@ -6,7 +6,9 @@ from db import save_poll
 logger = logging.getLogger(__name__)
 
 
-async def send_rating_poll_to_room(matrix_client, room_id: str, item_name: str):
+async def send_rating_poll_to_room(
+    matrix_client, room_id: str, item_name: str, chain_id: str | None = None
+):
     print(f"⭐ RATING POLL SERVICE CALLED for {item_name}")
     poll_id = uuid.uuid4().hex
 
@@ -25,6 +27,9 @@ async def send_rating_poll_to_room(matrix_client, room_id: str, item_name: str):
             "selected": None,
         },
     }
+
+    if chain_id:
+        dsl["data"]["chain_id"] = chain_id
 
     if not safe_send_dsl(dsl):
         logger.error("❌ Rating poll DSL invalid, not sending")
