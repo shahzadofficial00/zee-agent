@@ -15,6 +15,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
 - Terms & conditions — customers agree once before their first order (tap / typed name / drawn signature, whichever the device supports), with the signed text, version, method and timestamp kept as a record; "my agreements" shows the history and lets them read or download a copy of exactly what they agreed to
+- Countdown card — after ordering, a live timer showing the 15 minutes they have to cancel free of charge. The clock was always enforced; now the customer can see it
 - FAQ cards — a customer asking a common question gets a card with the saved answer, or the whole list as a tap-to-expand accordion if they say "faq". Answers come from a SQLite table you edit directly, never from the model
 - Table reservations
 - Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards — related questions share a `chain_id` so a multi-item order asks for its sizes, instructions and ratings in **one** card that advances in place, not a stack of them
@@ -69,6 +70,7 @@ Restaurant Agent/
     ├── reviews/review_scheduler.py        # Async scheduler for post-order reviews
     ├── terms/terms_service.py             # Terms card + agreement history + the terms text itself
     ├── faq/faq_service.py                 # FAQ card — one entry expanded, several as an accordion
+    ├── countdown/countdown_service.py     # Live countdown card (used for the cancel window)
     ├── auction/auction_service.py         # Auction + auction-result DSL cards, auction creation helper
     └── auction/auction_scheduler.py       # Async scheduler that closes due auctions and pays out the winner
 ```

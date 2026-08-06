@@ -31,6 +31,11 @@ def init_orders_schema(cur):
         cur.execute("ALTER TABLE orders ADD COLUMN fulfillment_method TEXT")
     if "fulfillment_summary" not in existing_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN fulfillment_summary TEXT")
+    # The Matrix event_id of the cancel-window countdown (JNO-85), so cancelling
+    # can redact it. On the order row rather than in a dict because a restart
+    # would otherwise orphan the card — the countdown outlives one process.
+    if "countdown_event_id" not in existing_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN countdown_event_id TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reservations (
@@ -218,14 +223,35 @@ def update_order_fulfillment(order_id: str, method: str, summary: str):
 def get_order_by_stable_id(stable_order_id: str) -> dict | None:
     """Resolve a human-readable order_id (ORD-XXXXXX) back to its room —
     needed by the staff order_status trigger, which only ever knows the
-    order_id printed on the customer's receipt, not the room it came from."""
+    order_id printed on the customer's receipt, not the room it came from.
+
+    `created_at` rides along so the cancel-window countdown (JNO-85) can be
+    anchored to the row's own timestamp — the same value
+    cancel_last_pending_order() compares against. Deriving the deadline from
+    "now" instead would drift a second or two later than the SQL cutoff, and a
+    countdown still showing time left after cancelling stopped working is
+    exactly the kind of small lie worth avoiding."""
     conn = _connect()
     cur = conn.execute(
-        "SELECT id, customer_name, room_id, status FROM orders WHERE stable_order_id = ?",
+        "SELECT id, customer_name, room_id, status, created_at, countdown_event_id "
+        "FROM orders WHERE stable_order_id = ?",
         (stable_order_id,),
     )
     row = cur.fetchone()
     conn.close()
     if not row:
         return None
-    return {"id": row[0], "customer_name": row[1], "room_id": row[2], "status": row[3]}
+    return {"id": row[0], "customer_name": row[1], "room_id": row[2],
+            "status": row[3], "created_at": row[4], "countdown_event_id": row[5]}
+
+
+def set_order_countdown_event(stable_order_id: str, event_id: str) -> None:
+    """Remember which Matrix event carries this order's cancel-window countdown,
+    so cancelling can redact it (JNO-85)."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE orders SET countdown_event_id = ? WHERE stable_order_id = ?",
+        (event_id, stable_order_id),
+    )
+    conn.commit()
+    conn.close()

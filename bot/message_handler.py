@@ -66,6 +66,29 @@ async def handle_custom_event(room: MatrixRoom, event):
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN MESSAGE HANDLER — routes every incoming RoomMessageText event
 # ─────────────────────────────────────────────────────────────────────────────
+async def _redact_cancel_countdown(room_id: str, stable_order_id: str) -> None:
+    """Remove the cancel-window countdown once the window has actually been used
+    (JNO-85).
+
+    The card only knows its `ends_at`, so left alone it keeps ticking "Free to
+    cancel" above the "order cancelled" message for the rest of the 15 minutes.
+    Redaction is the only way back: there's no inbound event and no id on the
+    card, both deliberate in the DSL contract.
+
+    Best-effort — the order is already cancelled and the customer has been told,
+    so a failed redact is a cosmetic leftover, never a lost cancellation.
+    """
+    try:
+        from db import get_order_by_stable_id
+        event_id = (get_order_by_stable_id(stable_order_id) or {}).get("countdown_event_id")
+        if not event_id:
+            return
+        await matrix_client.room_redact(room_id, event_id, reason="Order cancelled")
+        logger.info(f"⏳ Countdown redacted for {stable_order_id}")
+    except Exception as e:
+        logger.error(f"⏳ Countdown redact failed for {stable_order_id}: {e}")
+
+
 async def _handle_message(room: MatrixRoom, event: RoomMessageText):
     # ── Ignore messages from before bot start, from itself, or already processed ──
     if event.server_timestamp < BOT_START_TIME:
@@ -162,6 +185,7 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
                 cancelled_id = cancel_last_pending_order(sender, room_id)
                 if cancelled_id:
                     last_orders.pop(sender, None)
+                    await _redact_cancel_countdown(room_id, cancelled_id)
                     await send_text(room_id,
                         f"❌ Order {cancelled_id} cancelled!\n"
                         "You can place a new order anytime. 🍽️")

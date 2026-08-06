@@ -7,6 +7,52 @@ from bot.reviews.review_scheduler import schedule_review
 from bot.router.state import pending_orders, last_orders, logger
 from bot.router.ids import generate_unique_order_id
 
+async def _send_cancel_countdown(room_id: str, stable_order_id: str) -> None:
+    """Show the customer the 15-minute free-cancellation clock (JNO-85).
+
+    Anchored to the order row's `created_at` — the same column
+    cancel_last_pending_order() filters on — rather than to "now", which would
+    land a second or two late and leave the timer running after cancelling had
+    already stopped working.
+
+    SQLite writes CURRENT_TIMESTAMP as naive UTC 'YYYY-MM-DD HH:MM:SS'; the
+    client needs an offset-aware ISO string, so the tzinfo is attached here.
+    Best-effort: a countdown is a nicety, and nothing about the order depends
+    on it, so any failure is logged and swallowed rather than breaking a
+    receipt that already went out.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+        from db import get_order_by_stable_id
+        from db.orders import CANCEL_WINDOW_MINUTES
+        from bot.countdown.countdown_service import send_countdown_card
+
+        order = get_order_by_stable_id(stable_order_id)
+        created_at = (order or {}).get("created_at")
+        if not created_at:
+            logger.warning(f"⏳ No created_at for {stable_order_id} — skipping countdown")
+            return
+
+        created = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        ends_at = (created + timedelta(minutes=CANCEL_WINDOW_MINUTES)).isoformat()
+
+        event_id = await send_countdown_card(
+            room_id,
+            title="Free to cancel",
+            ends_at=ends_at,
+            subtitle='Reply "cancel" to call off this order — no charge.',
+            expired_text="Cancellation window closed — give us a call and we'll help.",
+        )
+        if event_id:
+            # Kept on the order row so cancelling can redact the card — a
+            # countdown still offering "free to cancel" above an "order
+            # cancelled" message is a small lie, and nothing else can retract it.
+            from db import set_order_countdown_event
+            set_order_countdown_event(stable_order_id, event_id)
+    except Exception as e:
+        logger.error(f"⏳ Cancel countdown failed for {stable_order_id}: {e}")
+
+
 def _is_history_placeholder(text: str) -> bool:
     """True for a bracketed pseudo-reply like "[Rating poll(s) sent for: X]" or
     "[FAQ card sent]".
@@ -398,6 +444,17 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
                 order_id=stable_order_id,
                 user_id=sender,
             )
+        # ── Cancel-window countdown (JNO-85) ─────────────────────────────────
+        # The 15-minute free-cancellation rule is real and already enforced in
+        # SQL, but until now the customer had no way to see the clock — it was
+        # only mentioned in an FAQ answer and clause 3 of the terms. Anchored to
+        # the order row's own created_at, which is exactly what
+        # cancel_last_pending_order() compares against, so the timer can't still
+        # show time left after cancelling has stopped working.
+        # Sits here rather than in order_flow.py so the LLM fallback path gets
+        # it too — both order paths converge on this branch.
+        await _send_cancel_countdown(room_id, stable_order_id)
+
         from bot.payment.payment_service import create_payment_intent
         await create_payment_intent(
             room_id=room_id,

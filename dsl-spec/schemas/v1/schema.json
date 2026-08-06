@@ -13,7 +13,7 @@
     },
     "type": {
       "type": "string",
-      "enum": ["menu", "payment", "appointment", "order_history", "menu_item", "menu_category", "order_confirmation", "banner", "poll", "poll_response", "poll_history", "poll_results", "tip_request", "auction", "auction_result", "fulfillment_method", "fulfillment_selection", "name_request", "name_response", "car_request", "car_response", "address_request", "address_response", "order_status", "terms", "terms_response", "terms_history", "faq"],
+      "enum": ["menu", "payment", "appointment", "order_history", "menu_item", "menu_category", "order_confirmation", "banner", "poll", "poll_response", "poll_history", "poll_results", "tip_request", "auction", "auction_result", "fulfillment_method", "fulfillment_selection", "name_request", "name_response", "car_request", "car_response", "address_request", "address_response", "order_status", "terms", "terms_response", "terms_history", "faq", "countdown"],
       "description": "DSL event type"
     },
     "data": {
@@ -204,6 +204,14 @@
       "then": {
         "properties": {
           "data": { "$ref": "#/$defs/faq_data" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "countdown" } } },
+      "then": {
+        "properties": {
+          "data": { "$ref": "#/$defs/countdown_data" }
         }
       }
     }
@@ -573,6 +581,17 @@
             }
           }
         }
+      }
+    },
+
+    "countdown_data": {
+      "type": "object",
+      "required": ["title", "ends_at"],
+      "properties": {
+        "title":        { "type": "string" },
+        "ends_at":      { "type": "string" },
+        "subtitle":     { "type": "string" },
+        "expired_text": { "type": "string" }
       }
     },
 

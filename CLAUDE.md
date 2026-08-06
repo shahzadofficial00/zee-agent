@@ -101,6 +101,8 @@ Restaurant Agent/
     │                            # needs_terms() — the per-order consent gate
     ├── faq/
     │   └── faq_service.py       # send_faq_card() — one card type for both FAQ stories
+    ├── countdown/
+    │   └── countdown_service.py # send_countdown_card() — no table, no inbound event
     └── auction/
         ├── auction_service.py    # auction/auction_result DSL cards + create_and_send_auction() creation helper
         └── auction_scheduler.py  # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
@@ -144,6 +146,7 @@ message_handler.py
     │                                            v2/v1 when ONLINE_PAYMENTS_ENABLED
     │                                         → payment intent  [skipped while cash-only]
     │                                         → rating poll(s) — N events, one card
+    │                                         → countdown card (15-min cancel window)
     │                                         → tip_request card [skipped unless TIPS_ENABLED]
     │
     ├── Order status (staff-triggered, NO LLM, NO chat exposure)
@@ -247,6 +250,7 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `address_response` | v1 | Inbound-only: line1/city (+ optional line2/notes/label) shared |
 | `terms` | v1 | Terms & conditions agreement card — text, plus a `signing_level` of `tap`/`typed`/`drawn` |
 | `terms_response` | v1 | Inbound-only: `agreed` + the `method` the device actually delivered (+ signature) |
+| `countdown` | v1 | Live countdown to a deadline (JNO-84/85). Outbound only — no inbound event, no table, no id. `ends_at` is ISO 8601 **with a UTC offset** (`datetime.now(timezone.utc).isoformat()`), same format `auction` already uses so the client parses both one way. `subtitle`/`expired_text` are omitted when empty so the client can use its own default |
 | `faq` | v1 | Q&A card (JNO-54). **One type covers both stories** — the client renders a single `items` entry expanded (the direct answer, JNO-55) and several as a collapsed accordion (JNO-56), so Python never picks a layout. `question`/`answer` must be **strings** — the Dart reads them as `String?` off a plain map, so a non-string throws in the cast (same class as the menu `price` bug). Answers are plain text; the widget library renders no markdown |
 | `terms_history` | v1 | Agreement history (JNO-98) — trigger card in the timeline, full list on tap. Declines included. `agreed` must be a real JSON bool, not SQLite's 0/1 |
 | `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
@@ -460,6 +464,24 @@ The one rule: **serve `body` from the row, never from the `TERMS_BODY` constant.
 `body` is **optional** in the `terms_history` contract. Agreements written before the column existed have none, and the client drops its "View copy" affordance rather than opening a blank page, so old rows keep rendering. `send_terms_history_card()` omits the key entirely rather than sending null.
 
 Checks: `python -m tests.test_terms` — 9 checks covering both schemas, the storage round-trip (decline / upgrade / redelivery / version bump / size cap), the four inbound-handler branches, and JNO-97's "agreement recorded" reply.
+
+---
+
+## Countdown (JNO-84/85)
+
+The leanest card in the repo: outbound only, no inbound event, **no table**. The deadline is just a timestamp the caller passes, so there's nothing to persist and nothing to clean up when it lapses — the client greys the card out. A bot that *acted* on expiry would be a scheduler, which the epic doesn't ask for.
+
+**Deliberately not an LLM tool.** A countdown makes a promise about time, and every LLM-triggered card here has misfired at least once (see the FAQ section). Triggered deterministically, like auction creation and order status.
+
+**The one real deadline it points at is the 15-minute cancel window.** None of JNO-85's own examples exist at Dot Cafe — no time-gated menu (open 12–12 straight), no flash sales, no held slots, no ETA data. But `CANCEL_WINDOW_MINUTES` is genuinely enforced in SQL and the customer previously had no way to see the clock; it was only in FAQ #4 and clause 3 of the terms.
+
+`_send_cancel_countdown()` (`bot/router/agent_dispatch.py`) fires from the `triggered_payment` branch, which is where the deterministic order flow **and** the LLM fallback both converge — one hook covers both paths.
+
+**The deadline is anchored to the order row's `created_at`, not to "now".** That's the same column `cancel_last_pending_order()` filters on, so the timer expires at the exact instant cancelling stops working. Deriving it from "now" would land a second or two late and leave the countdown showing time remaining after the SQL cutoff had passed. SQLite writes `CURRENT_TIMESTAMP` as naive UTC `'YYYY-MM-DD HH:MM:SS'`, so `timezone.utc` is attached before `.isoformat()` — a naive string would be read as local and land 5 hours out in Karachi.
+
+Best-effort by design: any failure is logged and swallowed. The receipt has already gone out and nothing about the order depends on the countdown.
+
+Checks: `python -m tests.test_countdown` — 3 checks covering the schema, empty-optional omission, and that the deadline matches the SQL rule exactly.
 
 ---
 

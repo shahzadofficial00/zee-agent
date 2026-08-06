@@ -38,6 +38,7 @@ from db.terms import (
 from db.faqs import (
     init_faqs_schema, get_faqs, get_faq,
 )
+from db.orders import set_order_countdown_event
 
 
 # ─────────────────────────────────────────────
