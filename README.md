@@ -15,6 +15,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
 - Terms & conditions — customers agree once before their first order (tap / typed name / drawn signature, whichever the device supports), with the signed text, version, method and timestamp kept as a record; "my agreements" shows the history and lets them read or download a copy of exactly what they agreed to
+- FAQ cards — a customer asking a common question gets a card with the saved answer, or the whole list as a tap-to-expand accordion if they say "faq". Answers come from a SQLite table you edit directly, never from the model
 - Table reservations
 - Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards — related questions share a `chain_id` so a multi-item order asks for its sizes, instructions and ratings in **one** card that advances in place, not a stack of them
 - Post-order review prompts on a delay
@@ -36,7 +37,7 @@ Restaurant Agent/
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
 │   ├── orders.py / customers.py / menu.py / payments.py
-│   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py
+│   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py / faqs.py
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -67,6 +68,7 @@ Restaurant Agent/
     ├── reviews/review_service.py          # Review card
     ├── reviews/review_scheduler.py        # Async scheduler for post-order reviews
     ├── terms/terms_service.py             # Terms card + agreement history + the terms text itself
+    ├── faq/faq_service.py                 # FAQ card — one entry expanded, several as an accordion
     ├── auction/auction_service.py         # Auction + auction-result DSL cards, auction creation helper
     └── auction/auction_scheduler.py       # Async scheduler that closes due auctions and pays out the winner
 ```
@@ -120,7 +122,7 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 
 ## Database
 
-**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids, conversation history, signed agreements.
+**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids, conversation history, signed agreements, FAQs.
 
 **Supabase** — remote, async: payment intents (orders and tips), reviews, review queue, authoritative menu source.
 
@@ -182,6 +184,25 @@ Everything you'd want to change lives at the top of `bot/terms/terms_service.py`
 > ⚠️ **`TERMS_BODY` ships with placeholders — `[PHONE]`, `[DELIVERY AREA]`, `[FEE]`.** Fill them before any customer sees the card. The text is also not legally reviewed; it describes what the code actually does (cash-only, 15-minute cancellation window, the four fulfillment methods) but that isn't the same as being fit to bind anyone.
 
 Each agreement is stored with the exact text that was shown, so a copy can be produced later even after the terms change. Customers can say **"my agreements"** to see their history and read or download what they signed.
+
+## FAQ
+
+Questions and answers live in the SQLite `faqs` table. Six drafts are seeded on first run, but **only into an empty table** — your edits survive restarts.
+
+```sql
+UPDATE faqs SET answer = '...' WHERE question = 'Do you deliver?';
+INSERT INTO faqs (question, answer) VALUES ('Do you have parking?', '...');
+```
+
+No restart needed for edits. Order in the accordion is insertion order.
+
+Matching is deterministic, not AI: an exact or substring hit on a stored question sends the card straight away. Anything else goes to the agent, which can rephrase toward a stored question — and if nothing fits, no card is sent and it answers in normal chat.
+
+> ⚠️ **The seeded answers are drafts.** They promise free delivery inside DHA Phase 4 and a 15-minute cancellation window. Read them before customers do.
+>
+> ⚠️ **Never put a bare "cancel" in a question.** `cancel` is an order-cancellation command; mid-checkout such a question would void the customer's order instead of answering it. Use "cancellation" (as the seeded row does).
+
+Seeding an FAQ is also the only way to make a specific answer **impossible** to get wrong — outside the table the model can still state things it doesn't actually know.
 
 ## Documentation
 

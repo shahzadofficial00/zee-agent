@@ -252,8 +252,34 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
                 await send_text(room_id, "💳 Please place an order first before paying!")
             return
 
-
-
+        # ── Fast-path: a confident FAQ hit bypasses the agent (JNO-55) ───────
+        # Deterministic for the same reason the order flow is (CLAUDE.md):
+        # matching a question against a stored list is mechanical, and leaving
+        # it to the LLM meant it imitated its own flattened history instead of
+        # calling show_faq — it answered "[FAQ card sent]", then "Got it!", and
+        # once invented opening hours rather than using the stored answer.
+        # Sits after the pay path so "how do I pay?" keeps its existing reply.
+        # Anything get_faq() can't match confidently still falls through to the
+        # agent, which can call show_faq/show_faqs itself.
+        # Anchored to the WHOLE message: "help" is the browse-all trigger, but
+        # "help me order a latte" is a real request that must reach the agent.
+        # Leading/trailing quotes tolerated so this behaves like the single-FAQ
+        # lookup below, which matches on substring and so never noticed them.
+        _FAQ_LIST_PATTERN = _re.compile(
+            r'[\'"]*(faq|faqs|help|questions|common questions|all questions)[\s?!.\'"]*',
+            flags=_re.IGNORECASE,
+        )
+        from db import get_faq as _get_faq, get_faqs as _get_faqs
+        _wants_faq_list = bool(_FAQ_LIST_PATTERN.fullmatch(message.strip()))
+        _faq_hit = None if _wants_faq_list else _get_faq(message)
+        if _faq_hit or _wants_faq_list:
+            await matrix_client.room_typing(room_id, typing_state=False)
+            from bot.faq.faq_service import send_faq_card
+            if _faq_hit:
+                await send_faq_card(room_id, [_faq_hit], title=_faq_hit["question"])
+            else:
+                await send_faq_card(room_id, _get_faqs())
+            return
 
         # ── AI agent ──────────────────────────────────────────────────────────
         print(f"📨 [{room_id}] {sender}: {message}")

@@ -208,7 +208,7 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
     # Deterministic, no LLM: record the consent, then resume or cancel the
     # order that _send_final_confirm_poll() parked at 'awaiting_terms'.
     if dsl_type == 'terms_response':
-        from bot.terms.terms_service import TERMS_ID, TERMS_VERSION, TERMS_BODY
+        from bot.terms.terms_service import TERMS_ID, TERMS_VERSION, TERMS_TITLE, TERMS_BODY
         from db import save_agreement
         data = dsl.get('data', {})
 
@@ -231,7 +231,7 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
 
         agreed = data.get('agreed') is True
         signature = data.get('signature') if agreed else None
-        save_agreement(
+        stored = save_agreement(
             user_id=sender,
             room_id=room_id,
             terms_id=terms_id,
@@ -246,17 +246,37 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
             # customer was shown. Reads must come from the row, never from here.
             body=TERMS_BODY,
         )
+        if not stored:
+            # Only rejection today is an oversized signature. Nothing was
+            # written, so needs_terms() is still True and the gate will re-send
+            # the card — say why, instead of silently redisplaying it.
+            await send_text(
+                room_id,
+                "❌ I couldn't store that signature — it came through too large. "
+                "Could you sign again?"
+            )
+            return True, None
+
+        # JNO-97: the customer has to be told the record landed. Sits here, not
+        # in the branches below, so every path that writes an agreement confirms
+        # it — the mid-checkout one included.
+        if agreed:
+            await send_text(
+                room_id,
+                f"✅ Agreement recorded — {TERMS_TITLE} ({TERMS_VERSION}). "
+                'Say "my agreements" any time to read your copy.'
+            )
 
         state = order_flows.get(sender)
         if not state or state.get('stage') != 'awaiting_terms':
             # Consent still recorded above — it's valid on its own. There's
             # just no parked order to resume (restart, or a stale card tapped
             # from scrollback).
-            await send_text(
-                room_id,
-                "✅ Thanks — your agreement has been recorded." if agreed
-                else "No problem — nothing has been recorded against your account."
-            )
+            if not agreed:
+                await send_text(
+                    room_id,
+                    "No problem — nothing has been recorded against your account."
+                )
             return True, None
 
         if not agreed:

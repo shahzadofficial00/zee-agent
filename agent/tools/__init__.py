@@ -11,6 +11,8 @@ from agent.tools.polls.send_special_instructions_poll import send_special_instru
 from agent.tools.polls.send_rating_poll import send_rating_poll
 from agent.tools.polls.show_poll_history import show_poll_history
 from agent.tools.polls.send_ranking_poll import send_ranking_poll
+from agent.tools.faq.show_faq import show_faq
+from agent.tools.faq.show_faqs import show_faqs
 
 
 
@@ -28,4 +30,6 @@ __all__ = [
     "send_rating_poll",
     "show_poll_history",
     "send_ranking_poll",
+    "show_faq",
+    "show_faqs",
 ]

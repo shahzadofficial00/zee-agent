@@ -73,9 +73,15 @@ def test_card_validates():
     print("[ok] card validates; bad signing_level and missing version rejected")
 
 
+# Every send_text the handler emits during a _run, so the confirmation JNO-97
+# asks for can actually be asserted on rather than swallowed by a noop.
+_sent: list[str] = []
+
+
 async def _run(dsl, saved, placed, stage="awaiting_terms"):
     """Drive one inbound terms_response with Supabase + order placement stubbed."""
     order_flows.clear()
+    _sent.clear()
     if stage:
         order_flows[SENDER] = {"stage": stage}
 
@@ -92,7 +98,8 @@ async def _run(dsl, saved, placed, stage="awaiting_terms"):
         return await handle_dsl_text_event(dsl, SENDER, ROOM)
 
 
-async def _noop(*args, **kwargs):
+async def _noop(room_id=None, message=None, *args, **kwargs):
+    _sent.append(message or "")
     return None
 
 
@@ -105,7 +112,11 @@ async def test_agree_places_order():
     # The flow has to leave awaiting_terms, or the customer's "Yes" to the
     # confirm poll lands in a stage that ignores it and the order never places.
     assert order_flows[SENDER]["stage"] == "final_confirm", "flow stuck at awaiting_terms"
-    print("[ok] agree -> recorded, then confirm poll sent")
+    # JNO-97 — the customer must be told the record landed. Before this, the
+    # mid-checkout path went straight to the confirm poll in silence.
+    assert any("Agreement recorded" in m and TERMS_VERSION in m for m in _sent), \
+        f"no confirmation sent on the happy path; got {_sent}"
+    print("[ok] agree -> recorded, confirmed to customer, then confirm poll sent")
 
 
 async def test_decline_cancels_order():

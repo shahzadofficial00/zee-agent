@@ -17,6 +17,17 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 Restaurant Agent/
 ├── main.py                     # Entry point — login/session restore, auto-join, callbacks, schedulers
 ├── config.py                   # Matrix credentials, feature flags
+├── tests/                      # Offline self-checks. Run as modules from the repo root
+│   │                           #   (`python -m tests.test_faq`) — a plain path invocation
+│   │                           #   puts tests/ on sys.path instead of the root and can't
+│   │                           #   import bot/db/agent.
+│   ├── test_terms.py           # JNO-90/97/98 — 9 checks
+│   └── test_faq.py             # JNO-54/55/56 — 4 checks
+│                               # ⚠️ test.py and test_status.py stay at the ROOT on purpose:
+│                               #   despite the names they are manual triggers, not tests —
+│                               #   they log into Matrix and fire real events at a live room
+│                               #   (auction creation / order-status cards). Same class as
+│                               #   update_order_status.py. Never run them as a suite.
 ├── dsl-spec/schemas/v1/schema.json  # In-repo copy of the DSL schema (see DSL Protocol)
 ├── store/                      # gitignored — E2EE olm keys (nio.db) + credentials.json
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
@@ -30,7 +41,8 @@ Restaurant Agent/
 │   ├── polls.py                 # Polls, poll answers, item ratings
 │   ├── auctions.py              # Auctions, bids, the locked-transaction bid logic
 │   ├── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
-│   └── terms.py                 # Signed agreements (has_agreed/save_agreement/get_agreements)
+│   ├── terms.py                 # Signed agreements (has_agreed/save_agreement/get_agreements)
+│   └── faqs.py                  # FAQ rows + the match ladder (get_faqs/get_faq) + seed drafts
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -46,6 +58,7 @@ Restaurant Agent/
 │       ├── polls/               # send_single_choice_poll.py, send_flavor_preference_poll.py,
 │       │                        # send_ranking_poll.py, send_rating_poll.py,
 │       │                        # send_special_instructions_poll.py, show_poll_history.py
+│       ├── faq/                 # show_faq.py, show_faqs.py
 │       └── show_banner.py       # Single tool, stays at root (no domain group needed)
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
@@ -86,6 +99,8 @@ Restaurant Agent/
     ├── terms/
     │   └── terms_service.py     # terms DSL card + the terms text itself (a constant) +
     │                            # needs_terms() — the per-order consent gate
+    ├── faq/
+    │   └── faq_service.py       # send_faq_card() — one card type for both FAQ stories
     └── auction/
         ├── auction_service.py    # auction/auction_result DSL cards + create_and_send_auction() creation helper
         └── auction_scheduler.py  # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
@@ -108,6 +123,8 @@ message_handler.py
     │   ├── "order history"       → send_order_history_card()
     │   ├── "pay/payment"         → send_existing_payment_card()
     │   ├── "cancel"              → cancel pending payment intent
+    │   ├── FAQ question match    → send_faq_card()  (JNO-55, deterministic)
+    │   ├── "faq"/"help"          → send_faq_card(all)  (JNO-56)
     │   └── DSL events            → review_submit / order_summary / tip_selected / tip_declined
     │
     ├── Deterministic order flow (order_flows state machine, NO LLM)
@@ -155,7 +172,9 @@ message_handler.py
                     ├── OPEN_POLL_TRIGGERED|...   → send_special_instructions_poll_to_room()
                     ├── RATING_POLL_TRIGGERED|... → send_rating_poll_to_room() (one event per
                     │                               item, one shared chain_id → ONE card)
-                    └── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
+                    ├── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
+                    ├── FAQ_TRIGGERED|name        → send_faq_card([one])
+                    └── FAQ_LIST_TRIGGERED        → send_faq_card(all)
 ```
 
 **Why a deterministic order flow exists at all:** the agent has no checkpointer — every poll answer is a fresh `agent.ainvoke()` with no real memory across turns. On repeat orders in the same conversation, the LLM would start imitating its own flattened text history and silently skip a tool call (e.g. reply with the size question as plain text instead of calling `send_single_choice_poll`) instead of progressing the flow. Since "which item still needs a size/instructions/confirmation answer" is fully mechanical, that entire sequence — including calling `confirm_order` directly — is owned by code (`bot/router/order_flow.py`, driven by `bot/message_handler.py`), and only hands off to the LLM for parts that genuinely need judgment (free-form chat, reservations, or an order whose item list couldn't be parsed).
@@ -182,6 +201,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `auction_bids` | One row per (auction_id, user_id) — a rebid updates the row in place rather than inserting a new one |
 | `conversation_history` | One row per user_id — their chat history as a JSON blob, so it survives a restart |
 | `agreements` | Signed T&C records — `UNIQUE(user_id, terms_id, version)`, so a re-synced event can't duplicate one act of consent |
+| `faqs` | Question/answer pairs (JNO-54). Seeded with drafts only when empty, so edits survive a restart. `ORDER BY id` is the accordion's order — no `sort_order`/`category` column |
 
 **Supabase** — remote, async:
 | Table | Purpose |
@@ -227,6 +247,7 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `address_response` | v1 | Inbound-only: line1/city (+ optional line2/notes/label) shared |
 | `terms` | v1 | Terms & conditions agreement card — text, plus a `signing_level` of `tap`/`typed`/`drawn` |
 | `terms_response` | v1 | Inbound-only: `agreed` + the `method` the device actually delivered (+ signature) |
+| `faq` | v1 | Q&A card (JNO-54). **One type covers both stories** — the client renders a single `items` entry expanded (the direct answer, JNO-55) and several as a collapsed accordion (JNO-56), so Python never picks a layout. `question`/`answer` must be **strings** — the Dart reads them as `String?` off a plain map, so a non-string throws in the cast (same class as the menu `price` bug). Answers are plain text; the widget library renders no markdown |
 | `terms_history` | v1 | Agreement history (JNO-98) — trigger card in the timeline, full list on tap. Declines included. `agreed` must be a real JSON bool, not SQLite's 0/1 |
 | `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
 
@@ -287,6 +308,8 @@ Incoming DSL events from the client are routed by `dsl.type`:
 | `send_rating_poll(item_name)` | Immediately after `ORDER_SAVED` | `"RATING_POLL_TRIGGERED\|..."` |
 | `show_poll_history()` | Customer asks to see their past poll answers | `"POLL_HISTORY_TRIGGERED"` |
 | `show_banner(variant, title, message, meta)` | Visual callout (outage, warning, success, info) | `"BANNER_TRIGGERED\|..."` |
+| `show_faq(question)` | A general question the fast path couldn't match — the LLM rephrases it toward a stored question | `"FAQ_TRIGGERED\|{matched question}"` or `"FAQ_NO_MATCH"` |
+| `show_faqs()` | Customer wants to browse every FAQ | `"FAQ_LIST_TRIGGERED"` |
 
 ### Middleware Stack (in order)
 1. **`RestaurantGuardrail`** — blocks banned keywords (prompt-injection phrases) before the LLM; checks the customer's **latest** human message
@@ -436,7 +459,37 @@ The one rule: **serve `body` from the row, never from the `TERMS_BODY` constant.
 
 `body` is **optional** in the `terms_history` contract. Agreements written before the column existed have none, and the client drops its "View copy" affordance rather than opening a blank page, so old rows keep rendering. `send_terms_history_card()` omits the key entirely rather than sending null.
 
-Checks: `python test_terms.py` — 9 assertions covering both schemas, the storage round-trip (decline / upgrade / redelivery / version bump / size cap) and the four inbound-handler branches.
+Checks: `python -m tests.test_terms` — 9 checks covering both schemas, the storage round-trip (decline / upgrade / redelivery / version bump / size cap), the four inbound-handler branches, and JNO-97's "agreement recorded" reply.
+
+---
+
+## FAQ (JNO-54)
+
+Two stories, **one** DSL type: JNO-55 (one relevant answer) and JNO-56 (browse them all) differ only in how many `items` the card carries, and the client picks the layout. The agent sends what it selected.
+
+**Matching is deterministic, in `message_handler.py`, not an LLM tool call.** This was learned the hard way — the LLM-driven version failed three separate ways in testing, all the same root cause (see below). `db.get_faq()` runs exact → substring either direction → stop. A miss is safe: nothing is sent and the message falls through to the agent.
+
+**There is deliberately no fuzzy tier.** `fuzzy_match_key()` was tried first, copying `show_item`'s ladder. On real questions difflib only fires where substring already failed, and every such case measured wrong: `"do you have parking for a minibus"` scores **0.60** against *"Do you cater for allergies?"*, while a question that genuinely should match (`"what payment methods do you take"` → *"How can I pay?"*) reaches only **0.35**. No cutoff separates those. Typo tolerance isn't needed either — the LLM writes that string, not the customer. Embeddings are the upgrade if logs show real misses.
+
+`show_faq`/`show_faqs` stay registered as the **semantic layer above the mechanical one**: a wording the substring match can't reach still gets to the agent, which can rephrase it toward a stored question. Confirmed working in testing — a message mangled by a copy-paste artefact missed the fast path and the LLM path still sent the right card.
+
+**No seeded question may contain a bare "cancel".** `\bcancel\b` (`message_handler.py`) intercepts before the agent, so such an FAQ is unreachable — and mid-checkout it drops the customer's in-flight order instead of answering. The seed says *"What is your cancellation policy?"* (`\b` doesn't match inside "cancellation"); `tests/test_faq.py` fails if any seeded question breaks this.
+
+**The seeded answers are drafts** and restate what the code does (cash-only, the 15-minute window, DHA Phase 4 delivery) — so they drift exactly like `TERMS_BODY`. Edit the rows, not the constant, once live.
+
+Checks: `python -m tests.test_faq` — 4 checks covering the schema (incl. non-string `answer`), the placeholder guard, seed/matching/cancel-shadowing, and the real emitted payload.
+
+### Card-only turns must never write a placeholder into history
+
+The bug that cost three debugging rounds, and the reason `clean_reply` matters more than it looks. `message_handler.py` writes `clean_reply` into conversation history, which is re-injected into the next agent call — **so the model copies it back out as its own answer instead of calling the tool.** Observed in production, in order:
+
+1. `clean_reply = "[FAQ card sent]"` → the customer was shown that literal string, three turns running
+2. Changed to `""` → the `or "Got it!"` fallback kicked in → the model answered `"Got it!"` instead
+3. Then it stopped calling the tool at all
+
+Fixed at the source: **no dispatch branch returns a bracketed pseudo-reply any more** — `[Banner sent: …]`, `[Poll history card sent]` and `[Rating poll(s) sent for: …]` all became `""`. The FAQ branch stores the **real answer text**, so if it does get imitated the customer still gets a correct reply, just as text. `_is_history_placeholder()` remains as a backstop for rows written before the fix.
+
+Any new card-only branch must follow the same rule: whatever goes in `clean_reply` should be a sentence that is **harmless if the model repeats it verbatim**.
 
 ---
 
@@ -589,3 +642,6 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 21. **Nothing guards against a `chain_id` collision** — since the client dropped its "previous question already answered" check, two senders picking the same value silently merge into one card, with no warning on either side. Only convention (the `rate_` prefix on rating polls) keeps them out of the checkout chain. See DSL Protocol → Poll chaining.
 22. **No terms-authoring surface** — the terms text is a hand-edited constant with a hand-bumped `TERMS_VERSION` (same "no admin UI yet" class as gaps #8/#11). The version suffixes in git history (`2026-08-05b/c/d`) are test artefacts from re-testing against the client's `terms_id@version` cache, not real revisions.
 23. **`awaiting_terms` is in-memory like every other checkout stage** — a restart while the customer has the terms card open loses the parked order (gap #5 again, not a new one). The agreement itself is safe: it's written to SQLite before the order is resumed, and the handler records consent even when there's no flow to resume.
+24. **FAQ matching is substring-only, so re-worded questions miss** — `"what payment methods do you take"` never reaches *"How can I pay?"* mechanically. The LLM layer catches some of these by rephrasing; the rest fall through to normal chat. Deliberate (see FAQ section — the fuzzy tier only ever produced wrong answers), but it means coverage is exactly what you seed.
+25. **The bot will still state facts it doesn't have** — the FAQ fast path is only authoritative for seeded questions. Everything else relies on a prompt rule, and a prompt is not a constraint. It invented "plenty of parking right outside the cafe" once. Prompt hardening reduced it (wifi/seating/catering now defer correctly), but the only deterministic fix is seeding the question. Hours and location ARE legitimately known — they're in `CAFE KNOWLEDGE` in `agent/prompt.py`.
+26. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.

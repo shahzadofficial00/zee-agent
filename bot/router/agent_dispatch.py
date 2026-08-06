@@ -7,6 +7,22 @@ from bot.reviews.review_scheduler import schedule_review
 from bot.router.state import pending_orders, last_orders, logger
 from bot.router.ids import generate_unique_order_id
 
+def _is_history_placeholder(text: str) -> bool:
+    """True for a bracketed pseudo-reply like "[Rating poll(s) sent for: X]" or
+    "[FAQ card sent]".
+
+    No branch produces these any more — that was the bug. clean_reply is written
+    into conversation history by message_handler and re-injected into the next
+    agent call, so the model started emitting one as its own literal answer
+    instead of calling the tool. Seen in production: a customer got
+    "[FAQ card sent]" three turns running, no cards.
+
+    Kept as a backstop, because rows written before the fix are still on disk
+    and the model will copy those until they age out of the 20-message cap.
+    """
+    return bool(_re.fullmatch(r'\[.*\bsent\b.*\]', text.strip(), _re.DOTALL))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT RESULT DISPATCH — parse signal strings out of the agent's messages,
 # send the matching DSL card/flow, and return cleaned reply text for history.
@@ -43,6 +59,8 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     triggered_multi_poll = None
     triggered_ranking_poll = None
     triggered_banner = None
+    triggered_faq = None
+    triggered_faq_list = False
     triggered_open_poll = None
     triggered_rating_poll = None
     triggered_poll_history = False
@@ -63,7 +81,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         await matrix_client.room_typing(room_id, typing_state=False)
         from bot.banner_service import send_banner_card
         await send_banner_card(room_id=room_id, **triggered_banner)
-        return f"[Banner sent: {triggered_banner['title']}]"
+        return ""
 
     # ── ORDER_HISTORY_TRIGGERED / MENU_TRIGGERED — simple membership checks ──
     if any("ORDER_HISTORY_TRIGGERED" in c for c in all_content):
@@ -89,6 +107,19 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
                 cat_match = _re.search(r'CATEGORY_TRIGGERED\|(.+)', msg_content)
                 if cat_match:
                     triggered_category = cat_match.group(1).strip()
+                break
+
+    # ── FAQ_TRIGGERED|{question} / FAQ_LIST_TRIGGERED — JNO-55 / JNO-56 ───────
+    # No substring collision between the two markers, unlike the POLL_ family.
+    if any("FAQ_LIST_TRIGGERED" in c for c in all_content):
+        triggered_faq_list = True
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "FAQ_TRIGGERED" in msg_content:
+                faq_match = _re.search(r'FAQ_TRIGGERED\|(.+)', msg_content)
+                if faq_match:
+                    triggered_faq = faq_match.group(1).strip()
                 break
 
     # ── POLL_TRIGGERED|{question}|{options} — single-choice poll ──────────────
@@ -242,6 +273,14 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     reply = _re.sub(r'POLL_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = _re.sub(r'BANNER_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = reply.replace("POLL_HISTORY_TRIGGERED", "").strip()
+    reply = _re.sub(r'FAQ_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = reply.replace("FAQ_LIST_TRIGGERED", "").strip()
+    # show_faq's miss signal — the model is told to answer normally after one,
+    # but it sometimes echoes the marker alongside its answer.
+    reply = reply.replace("FAQ_NO_MATCH", "").strip()
+
+    if _is_history_placeholder(reply):
+        reply = ""
 
 
     if "ORDER_HISTORY_CARD" in reply:
@@ -260,12 +299,15 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         reply = ""
     if triggered_poll_history:
         reply = ""
+    if triggered_faq or triggered_faq_list:
+        # The card already shows the question and the answer.
+        reply = ""
     if triggered_poll or triggered_multi_poll or triggered_ranking_poll:
         # The poll card already renders the question — never also send it as text.
         reply = ""
 
     # ── Nothing triggered and no text — fall back to a generic apology ────────
-    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history:
+    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history and not triggered_faq and not triggered_faq_list:
 
         reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
 
@@ -279,7 +321,25 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     await matrix_client.room_typing(room_id, typing_state=False)
 
     # ── Dispatch: send the one card/flow that matches whichever trigger fired ──
-    if triggered_menu:
+    if triggered_faq or triggered_faq_list:
+        # One card type for both stories — a single entry renders expanded
+        # (JNO-55), several render as the accordion (JNO-56).
+        from db import get_faq, get_faqs
+        from bot.faq.faq_service import send_faq_card
+        # Whatever goes in clean_reply lands in conversation history and the
+        # model copies it back out as its own answer on the next similar
+        # question — that is the whole bug this feature kept hitting
+        # ("[FAQ card sent]", then "Got it!"). So store the real answer: if it
+        # gets imitated the customer still gets a correct reply as text, just
+        # without the card, instead of a meaningless stub.
+        if triggered_faq:
+            faq = get_faq(triggered_faq)
+            await send_faq_card(room_id, [faq] if faq else [], title=triggered_faq)
+            clean_reply = faq["answer"] if faq else ""
+        else:
+            await send_faq_card(room_id, get_faqs())
+            clean_reply = "Here are the questions we get asked most — tap any one to see the answer."
+    elif triggered_menu:
         await send_menu(room_id)
     elif triggered_payment:
         # Order confirmed — reuse the fulfillment flow's pre-generated order id
@@ -408,7 +468,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     elif triggered_poll_history:
         from bot.polls.poll_history_service import send_poll_history_card
         await send_poll_history_card(matrix_client, room_id, sender)
-        clean_reply = "[Poll history card sent]"
+        clean_reply = ""
 
 
     elif triggered_banner:
@@ -420,7 +480,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
             message=triggered_banner["message"],
             meta=triggered_banner["meta"],
         )
-        clean_reply = f"[Banner sent: {triggered_banner['title']}]"
+        clean_reply = ""
     else:
         await send_text(room_id, reply)
 
@@ -433,7 +493,5 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         chain_id = f"rate_{last_orders.get(sender, {}).get('order_id') or _uuid.uuid4().hex[:8]}"
         for item_name in item_names:
             await send_rating_poll_to_room(matrix_client, room_id, item_name, chain_id=chain_id)
-        if not clean_reply:
-            clean_reply = f"[Rating poll(s) sent for: {', '.join(item_names)}]"
 
     return clean_reply
