@@ -29,7 +29,8 @@ Restaurant Agent/
 │   ├── reviews.py               # Supabase reviews + review queue
 │   ├── polls.py                 # Polls, poll answers, item ratings
 │   ├── auctions.py              # Auctions, bids, the locked-transaction bid logic
-│   └── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
+│   ├── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
+│   └── terms.py                 # Signed agreements (has_agreed/save_agreement/get_agreements)
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -82,6 +83,9 @@ Restaurant Agent/
     ├── reviews/
     │   ├── review_service.py    # Review card
     │   └── review_scheduler.py  # Async scheduler for post-order reviews
+    ├── terms/
+    │   └── terms_service.py     # terms DSL card + the terms text itself (a constant) +
+    │                            # needs_terms() — the per-order consent gate
     └── auction/
         ├── auction_service.py    # auction/auction_result DSL cards + create_and_send_auction() creation helper
         └── auction_scheduler.py  # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
@@ -114,7 +118,9 @@ message_handler.py
     │                          →  fulfillment_method card (Dine-in/Pickup/Car/Delivery)
     │                          →  method detail card (name_request, or car/address_request
     │                          │   → client-side saved-vehicle/address picker)
-    │                          →  final "Shall I proceed?" poll   [now the true last step]
+    │                          →  terms card  [only if not already agreed to the
+    │                          │   current TERMS_VERSION; parks at awaiting_terms]
+    │                          →  final "Shall I proceed?" poll  [the true last step]
     │                          →  confirm_order.invoke() called directly
     │                          →  ORDER_SAVED → order_confirmation card (with fulfillment
     │                                            summary) — v3 while cash-only,
@@ -175,6 +181,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `auctions` | Auction metadata (title, starting_price, min_bid, ends_at, room_id, closed flag) |
 | `auction_bids` | One row per (auction_id, user_id) — a rebid updates the row in place rather than inserting a new one |
 | `conversation_history` | One row per user_id — their chat history as a JSON blob, so it survives a restart |
+| `agreements` | Signed T&C records — `UNIQUE(user_id, terms_id, version)`, so a re-synced event can't duplicate one act of consent |
 
 **Supabase** — remote, async:
 | Table | Purpose |
@@ -218,6 +225,9 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `car_response` | v1 | Inbound-only: make/model/color/plate_number (+ optional label) shared |
 | `address_request` | v1 | Opens the client's saved-address picker/add sheet (reads/writes Supabase `addresses`, same client-owned pattern as `vehicles`) |
 | `address_response` | v1 | Inbound-only: line1/city (+ optional line2/notes/label) shared |
+| `terms` | v1 | Terms & conditions agreement card — text, plus a `signing_level` of `tap`/`typed`/`drawn` |
+| `terms_response` | v1 | Inbound-only: `agreed` + the `method` the device actually delivered (+ signature) |
+| `terms_history` | v1 | Agreement history (JNO-98) — trigger card in the timeline, full list on tap. Declines included. `agreed` must be a real JSON bool, not SQLite's 0/1 |
 | `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
 
 Incoming DSL events from the client are routed by `dsl.type`:
@@ -227,6 +237,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `tip_declined` — customer skipped the tip → plain text ack (no LLM)
 - `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
 - `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
+- `terms_response` — customer agreed to / declined the order terms → records the agreement, then resumes or cancels the parked order (no LLM). See Terms & Conditions below
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
 
 **Poll chaining (`chain_id`):** any `poll` card can carry an optional `data.chain_id`. Every poll sharing a value is drawn client-side as **one** card that advances question-to-question in place, instead of N stacked cards; the folded-in events are hidden as tiles. Omit it for a standalone question (a confirmation) so it keeps its own card. Used by:
@@ -395,6 +406,40 @@ Under the hood: `send_order_status_update(order_id, status, message)` (`bot/orde
 
 ---
 
+## Terms & Conditions (JNO-90)
+
+Gated on **every order**, but a customer only ever signs **once per terms version**:
+
+1. Fulfillment details settled → `_send_final_confirm_poll()` (`bot/router/order_flow.py`) checks `needs_terms(sender)` **before** sending the poll
+2. Already agreed to the current `TERMS_VERSION` → the confirm poll goes out exactly as before, no card
+3. Not agreed → `terms` card goes out *instead*, the flow parks at stage `awaiting_terms` (state stays alive in `order_flows`)
+4. Client replies `terms_response` → `bot/router/dsl_text_events.py` records it via `db.save_agreement()`, sets stage back to `final_confirm` and calls `_send_final_confirm_poll()` again — which now falls through the gate — or clears the flow on a decline
+5. "Shall I proceed?" → **Yes** → order places, unchanged
+
+**Terms come before the final confirm, not after** — same reasoning as fulfillment (see Key Design Decisions): "Yes" has to be the true last step, so the customer isn't confirming an order and only then being asked to sign for it, and a decline cancels nothing they'd already agreed to.
+
+The gate sits **inside** `_send_final_confirm_poll()` rather than at its callers because all three fulfillment responses (`name_response`/`car_response`/`address_response`) route through that one function — one guard covers them, and a fourth fulfillment method would inherit it for free. The re-entry after consent is deliberate and can't loop: `needs_terms()` is False the second time because the agreement was written first.
+
+**`method` is stored, never `signing_level`.** The card *requests* a level; the client's fallback chain (drawn → typed → tap, on device capability) decides what it can actually deliver and reports it back as `method`. Storing the request would claim a drawn signature that was never produced.
+
+**The terms text is a constant in `bot/terms/terms_service.py`, not a table.** Nothing in JNO-90 authors a terms version — there's no admin surface, so a table would be hand-seeded anyway, and git already gives immutable version history. Ordering is also deliberately SQLite-backed so checkout doesn't depend on the network; reading the agreement text remotely would undo that. **Bump `TERMS_VERSION` whenever `TERMS_BODY` changes** — agreements are keyed `(terms_id, version)`, so a bump re-prompts everyone automatically, and leaving it stale silently records new consent against old text.
+
+Inbound `terms_response` is a trust boundary (inbound DSL is never schema-validated), so the handler drops anything whose `terms_id`/`version` doesn't match what was published, or whose `method` is outside the enum — otherwise anyone could fabricate a signature on a document that never existed. `db/terms.py` caps signature size again server-side; the Flutter card's own 48KB cap binds only clients that choose to honour it.
+
+A decline is recorded but does **not** satisfy the gate (`agreed = 1` only), and a later agreement upgrades that same row rather than leaving a stale `declined` record shadowing real consent.
+
+**Agreement history (JNO-98)** — `send_terms_history_card(room_id, user_id)` builds the list from `db.get_agreements()`. Triggered by a fast-path pattern in `message_handler.py` ("my agreements", "agreement history", "what did i agree to"), no LLM, same shape as the order-history fast path. Declines are included on purpose. Signature blobs are **not** sent — `get_agreements()` omits them, since a base64 PNG per row would dwarf the rest of the payload. Capped at 20 rows: every `body` rides along in one Matrix event, which dies past ~64KB.
+
+**The `body` snapshot (JNO-97)** — `agreements.body` holds the exact text the customer was shown, written at sign time and never joined from a versions table. Duplicating it per agreement is the point: the row is then immune to any later edit of `TERMS_BODY`, which is what makes it a consent record rather than a timestamp.
+
+The one rule: **serve `body` from the row, never from the `TERMS_BODY` constant.** Rendering today's wording under an old version number looks authoritative and is wrong. Snapshotting the constant is safe in exactly one place — `dsl_text_events.py` at write time — because the version guard immediately above it has already rejected anything that isn't the currently published version.
+
+`body` is **optional** in the `terms_history` contract. Agreements written before the column existed have none, and the client drops its "View copy" affordance rather than opening a blank page, so old rows keep rendering. `send_terms_history_card()` omits the key entirely rather than sending null.
+
+Checks: `python test_terms.py` — 9 assertions covering both schemas, the storage round-trip (decline / upgrade / redelivery / version bump / size cap) and the four inbound-handler branches.
+
+---
+
 ## Review Scheduler
 
 After each paid order (if `REVIEW_CARD_ENABLED=true`):
@@ -512,8 +557,9 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 - **Poll chaining is fire-and-forget, enforced client-side** — the bot sends all N chained polls at once and never tracks which have been answered. The alternative (send one, wait for its `poll_response`, send the next) is another per-user state machine in `order_flows`, which is in-memory only and would strand a customer mid-ratings on any restart. The cost is that collision-avoidance is now pure convention — see gap #21.
 - **Fast-path bypass** — common intents (menu, pay, order history, cancel) are intercepted before the agent to reduce latency and LLM cost.
 - **DSL validation** — all outbound DSL payloads are validated against a JSON schema before sending to prevent malformed UI cards reaching clients. Inbound DSL (customer responses) is not schema-validated.
-- **Fulfillment before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details are already known, so the receipt reflects everything at once instead of the customer confirming before fulfillment even entered the picture.
+- **Fulfillment and terms before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, the terms card (if needed) right after those, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details and consent are both already settled. The receipt reflects everything at once, and the customer never confirms an order before fulfillment or the agreement has entered the picture.
 - **Feature flags over code removal for the cash-only transition** — `ONLINE_PAYMENTS_ENABLED`/`TIPS_ENABLED` gate behavior; the Swich integration, tip handlers, and v1/v2 receipt senders all stay in the tree, untouched. Re-enabling is an `.env` edit plus a restart, not a revert. Both default to `false` on purpose: this gates real money movement, so a missing env var must fail closed.
+- **Terms gate is automatic and version-keyed, not a CLI** — unlike auctions and order status, consent isn't staff-triggered: it fires from the order flow itself, and `has_agreed(user_id, terms_id, version)` means a repeat customer signs once rather than per order. Sending it on first contact was rejected — most customers never place an order, so it would store thousands of signatures for interactions that never happened, and open every conversation with a legal document. The terms text also deliberately never passes through the LLM: a paraphrased contract is a fabricated one.
 - **Manual CLI triggers over premature admin UI** — both `create_and_send_auction()` and `send_order_status_update()` are called directly (via `test.py`/`update_order_status.py`), not exposed to the LLM or gated behind a permission system that doesn't exist yet. A real staff surface can call the same functions later without touching the underlying logic.
 
 ---
@@ -541,3 +587,5 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 19. **Per-sender locks and task set grow without bound** — `_sender_locks`/`_running_tasks` in `bot/message_handler.py` never evict a sender. One `asyncio.Lock` per customer forever; fine at a coffee shop's user count, would need eviction at scale.
 20. **The in-repo schema is now a second copy, not the source of truth** — `dsl-spec/` was an unversioned Desktop folder shared by hand with the Flutter app; copying it in fixed the "not in git" problem but made the drift in gap #4 concrete. Nothing checks the two copies against each other.
 21. **Nothing guards against a `chain_id` collision** — since the client dropped its "previous question already answered" check, two senders picking the same value silently merge into one card, with no warning on either side. Only convention (the `rate_` prefix on rating polls) keeps them out of the checkout chain. See DSL Protocol → Poll chaining.
+22. **No terms-authoring surface** — the terms text is a hand-edited constant with a hand-bumped `TERMS_VERSION` (same "no admin UI yet" class as gaps #8/#11). The version suffixes in git history (`2026-08-05b/c/d`) are test artefacts from re-testing against the client's `terms_id@version` cache, not real revisions.
+23. **`awaiting_terms` is in-memory like every other checkout stage** — a restart while the customer has the terms card open loses the parked order (gap #5 again, not a new one). The agreement itself is safe: it's written to SQLite before the order is resumed, and the handler records consent even when there's no flow to resume.

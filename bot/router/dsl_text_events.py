@@ -204,6 +204,78 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
             logger.info(f"🔨 Bid accepted | {auction_id} | {sender} | Rs {amount}")
         return True, None
 
+    # ── terms_response — customer agreed to / declined the order terms ───
+    # Deterministic, no LLM: record the consent, then resume or cancel the
+    # order that _send_final_confirm_poll() parked at 'awaiting_terms'.
+    if dsl_type == 'terms_response':
+        from bot.terms.terms_service import TERMS_ID, TERMS_VERSION, TERMS_BODY
+        from db import save_agreement
+        data = dsl.get('data', {})
+
+        # Inbound DSL is never schema-validated, so everything below is a
+        # trust boundary. An agreement recorded against a terms_id/version we
+        # never published would be a signature on a document that doesn't
+        # exist — drop it rather than store it.
+        terms_id = str(data.get('terms_id', '')).strip()
+        version = str(data.get('version', '')).strip()
+        if terms_id != TERMS_ID or version != TERMS_VERSION:
+            logger.warning(
+                f"⏭️ Dropping terms_response for unknown {terms_id}@{version} from {sender}"
+            )
+            return True, None
+
+        method = str(data.get('method', '')).strip()
+        if method not in ('tap', 'typed', 'drawn'):
+            logger.warning(f"⏭️ Dropping terms_response with bad method={method!r} from {sender}")
+            return True, None
+
+        agreed = data.get('agreed') is True
+        signature = data.get('signature') if agreed else None
+        save_agreement(
+            user_id=sender,
+            room_id=room_id,
+            terms_id=terms_id,
+            version=version,
+            agreed=agreed,
+            method=method,
+            signature=signature if isinstance(signature, str) else None,
+            signed_at=str(data.get('signed_at', '')),
+            # Safe to snapshot the constant here and *only* here: the version
+            # guard above already rejected anything that isn't the currently
+            # published version, so TERMS_BODY is by definition the text this
+            # customer was shown. Reads must come from the row, never from here.
+            body=TERMS_BODY,
+        )
+
+        state = order_flows.get(sender)
+        if not state or state.get('stage') != 'awaiting_terms':
+            # Consent still recorded above — it's valid on its own. There's
+            # just no parked order to resume (restart, or a stale card tapped
+            # from scrollback).
+            await send_text(
+                room_id,
+                "✅ Thanks — your agreement has been recorded." if agreed
+                else "No problem — nothing has been recorded against your account."
+            )
+            return True, None
+
+        if not agreed:
+            order_flows.pop(sender, None)
+            await send_text(
+                room_id,
+                "No problem — I haven't placed the order. "
+                "We can't take orders without agreeing to the terms, but I'm here if you have questions 🙏"
+            )
+            return True, None
+
+        # Consent is on file now, so the gate inside _send_final_confirm_poll()
+        # falls through this time and the customer gets the "Shall I proceed?"
+        # poll they'd otherwise have seen before the terms card.
+        state['stage'] = 'final_confirm'
+        from bot.router.order_flow import _send_final_confirm_poll
+        await _send_final_confirm_poll(sender, room_id)
+        return True, None
+
     # ── poll — the bot's own poll card being echoed back to the room ─────
     elif dsl_type == 'poll':
         # Bot's own poll card being echoed back — skip

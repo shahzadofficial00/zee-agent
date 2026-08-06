@@ -14,6 +14,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Order status updates (Preparing/Ready/On the way/Delivered) pushed to the customer's chat, triggered by a staff CLI script
 - Post-order tip prompt with preset/custom amounts, paid through the same Swich flow as orders
 - Order history lookup
+- Terms & conditions — customers agree once before their first order (tap / typed name / drawn signature, whichever the device supports), with the signed text, version, method and timestamp kept as a record; "my agreements" shows the history and lets them read or download a copy of exactly what they agreed to
 - Table reservations
 - Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards — related questions share a `chain_id` so a multi-item order asks for its sizes, instructions and ratings in **one** card that advances in place, not a stack of them
 - Post-order review prompts on a delay
@@ -35,7 +36,7 @@ Restaurant Agent/
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
 │   ├── orders.py / customers.py / menu.py / payments.py
-│   └── reviews.py / polls.py / auctions.py
+│   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
@@ -65,6 +66,7 @@ Restaurant Agent/
     │                                       # poll_history_service, poll_results_service
     ├── reviews/review_service.py          # Review card
     ├── reviews/review_scheduler.py        # Async scheduler for post-order reviews
+    ├── terms/terms_service.py             # Terms card + agreement history + the terms text itself
     ├── auction/auction_service.py         # Auction + auction-result DSL cards, auction creation helper
     └── auction/auction_scheduler.py       # Async scheduler that closes due auctions and pays out the winner
 ```
@@ -118,7 +120,7 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 
 ## Database
 
-**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids.
+**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids, conversation history, signed agreements.
 
 **Supabase** — remote, async: payment intents (orders and tips), reviews, review queue, authoritative menu source.
 
@@ -163,6 +165,23 @@ python update_order_status.py ORD-AB12CD preparing
 python update_order_status.py ORD-AB12CD ready
 python update_order_status.py ORD-AB12CD delivered
 ```
+
+## Terms & Conditions
+
+Customers agree to the order terms once, just before the final "Shall I proceed?" confirmation. Agreeing again isn't asked for on later orders — unless the terms themselves change.
+
+Everything you'd want to change lives at the top of `bot/terms/terms_service.py`:
+
+| Constant | |
+|---|---|
+| `TERMS_BODY` | The agreement text itself |
+| `TERMS_VERSION` | **Bump this whenever `TERMS_BODY` changes** — agreements are keyed on it, so a bump re-prompts every customer. Leave it stale and the bot records fresh consent against text nobody saw |
+| `TERMS_SIGNING_LEVEL` | `"tap"` (button) / `"typed"` (name) / `"drawn"` (signature canvas). The client drops a rung if the device can't manage it, and stores what actually happened |
+| `TERMS_ALLOW_DECLINE` | Whether the card offers a Decline button |
+
+> ⚠️ **`TERMS_BODY` ships with placeholders — `[PHONE]`, `[DELIVERY AREA]`, `[FEE]`.** Fill them before any customer sees the card. The text is also not legally reviewed; it describes what the code actually does (cash-only, 15-minute cancellation window, the four fulfillment methods) but that isn't the same as being fit to bind anyone.
+
+Each agreement is stored with the exact text that was shown, so a copy can be produced later even after the terms change. Customers can say **"my agreements"** to see their history and read or download what they signed.
 
 ## Documentation
 

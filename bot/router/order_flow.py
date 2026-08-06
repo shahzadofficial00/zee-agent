@@ -3,9 +3,10 @@ from bot.matrix_client import matrix_client, send_text
 from bot.router.state import (
     order_flows, last_order_line, last_order_state,
     awaiting_reorder_confirmation, _REORDER_AFFIRMATIONS, conversation_histories,
-    ensure_history_loaded, persist_history,
+    ensure_history_loaded, persist_history, logger,
 )
 from bot.router.agent_dispatch import _dispatch_agent_result
+from bot.terms.terms_service import needs_terms, send_terms_card
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DETERMINISTIC ORDER FLOW — per-item size + special-instructions loop
@@ -100,6 +101,31 @@ async def _send_next_order_flow_poll(sender: str, room_id: str) -> None:
 
 
 async def _send_final_confirm_poll(sender: str, room_id: str) -> None:
+    """Ask the final "Shall I proceed?" — but gate on the terms first (JNO-90).
+
+    The terms card goes out *before* this poll, not after, for the same reason
+    fulfillment does: "Yes" has to be the true last step, so the customer isn't
+    confirming an order and only then being asked to sign for it. A decline
+    then cancels nothing they'd already agreed to.
+
+    The gate sits inside this function rather than at its callers because all
+    three fulfillment responses (name/car/address) route through here — one
+    guard covers them, and a fourth fulfillment method would inherit it free.
+
+    When terms are needed the flow parks at `awaiting_terms` and this poll is
+    skipped; `dsl_text_events.py` calls back in once consent is recorded, and
+    the gate falls through the second time.
+    """
+    state = order_flows.get(sender)
+    if state and needs_terms(sender):
+        if await send_terms_card(room_id):
+            state["stage"] = "awaiting_terms"
+            return
+        # Schema validation blocked the card, so no response is coming. Don't
+        # strand a paying customer behind a bug in our own payload — log it
+        # loudly and let the order through ungated.
+        logger.error(f"❌ Terms card failed validation — proceeding ungated for {sender}")
+
     from bot.polls.poll_service import send_single_choice_poll_to_room
     await send_single_choice_poll_to_room(
         matrix_client, room_id, "Confirm your order — Shall I proceed?", ["Yes", "No"]

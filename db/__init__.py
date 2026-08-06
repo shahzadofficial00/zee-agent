@@ -32,6 +32,9 @@ from db.auctions import (
 from db.conversation_history import (
     init_conversation_history_schema, load_history, save_history,
 )
+from db.terms import (
+    init_agreements_schema, has_agreed, save_agreement, get_agreements,
+)
 
 
 # ─────────────────────────────────────────────
@@ -48,6 +51,7 @@ def init_db():
     init_polls_schema(cur)
     init_auctions_schema(cur)
     init_conversation_history_schema(cur)
+    init_agreements_schema(cur)
 
     conn.commit()
     conn.close()

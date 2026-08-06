@@ -212,6 +212,21 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
             await send_order_history_card(room_id, sender)
             return
 
+        # ── Fast-path: agreement history bypasses the agent entirely (JNO-98) ─
+        # Checked before the order-history path would ever be reached for these
+        # phrasings, and kept word-bounded like the others so "I agree" during a
+        # terms card can't trip it.
+        _TERMS_HISTORY_PATTERN = _re.compile(
+            r'\b(agreement history|my agreements|show my agreements|terms history|'
+            r'my terms|signed terms|what did i agree to|what have i agreed to)\b',
+            flags=_re.IGNORECASE,
+        )
+        if _TERMS_HISTORY_PATTERN.search(message.lower().strip()):
+            await matrix_client.room_typing(room_id, typing_state=False)
+            from bot.terms.terms_service import send_terms_history_card
+            await send_terms_history_card(room_id, sender)
+            return
+
         # ── Fast-path: payment intent request bypasses the agent entirely ────
         _PAY_INTENT_PATTERN = _re_pay.compile(
                 r'\b(pay|payment|pay now|make payment|i want to pay|let me pay|can i pay|how do i pay|pay for (it|this|my order))\b',
