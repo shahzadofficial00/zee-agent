@@ -110,6 +110,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     triggered_open_poll = None
     triggered_rating_poll = None
     triggered_poll_history = False
+    triggered_calculator = None
 
 
     all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
@@ -166,6 +167,25 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
                 faq_match = _re.search(r'FAQ_TRIGGERED\|(.+)', msg_content)
                 if faq_match:
                     triggered_faq = faq_match.group(1).strip()
+                break
+
+    # ── CALC_TRIGGERED|{json} — calculator card (JNO-237) ─────────────────────
+    # JSON rather than the pipe convention every other signal uses, because the
+    # fields are nested objects. raw_decode stops at the end of the JSON value,
+    # so trailing chatter on the same line doesn't lose the whole card. Nothing
+    # parsed here is trusted — calculator_service re-validates the field list
+    # and the formula before anything is sent.
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "CALC_TRIGGERED" in msg_content:
+                calc_match = _re.search(r'CALC_TRIGGERED\|(\{.+)', msg_content)
+                if calc_match:
+                    import json as _json
+                    try:
+                        triggered_calculator, _ = _json.JSONDecoder().raw_decode(calc_match.group(1))
+                    except Exception as e:
+                        logger.error(f"🧮 Bad CALC_TRIGGERED payload: {e}")
                 break
 
     # ── POLL_TRIGGERED|{question}|{options} — single-choice poll ──────────────
@@ -310,6 +330,11 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     reply = _re.sub(r'ITEM_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = _re.sub(r'CATEGORY_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = reply.replace("CATEGORY_CARD", "").strip()
+    # ITEM_CARD was never stripped — it isn't shown to the customer (the
+    # triggered_item branch sends no text), but it reached clean_reply and so
+    # conversation history, which the model then imitates. Same failure as the
+    # "[FAQ card sent]" placeholders; seen live as `🤖 REPLY: ITEM_CARD`.
+    reply = reply.replace("ITEM_CARD", "").strip()
     reply = _re.sub(r'PAYMENT_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = reply.replace("ORDER_HISTORY_TRIGGERED", "").strip()
     reply = _re.sub(r'MULTI_POLL_TRIGGERED\|[^\n]+', '', reply).strip()
@@ -321,6 +346,12 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     reply = reply.replace("POLL_HISTORY_TRIGGERED", "").strip()
     reply = _re.sub(r'FAQ_TRIGGERED\|[^\n]+', '', reply).strip()
     reply = reply.replace("FAQ_LIST_TRIGGERED", "").strip()
+    reply = _re.sub(r'CALC_TRIGGERED\|[^\n]+', '', reply).strip()
+    # send_calculator's miss signals. The model is told to recover from each,
+    # but it sometimes echoes the marker alongside its answer — same as
+    # FAQ_NO_MATCH.
+    reply = _re.sub(r'CALC_NO_(?:CATEGORY|ITEM)\|[^\n]*', '', reply).strip()
+    reply = reply.replace("CALC_MENU_UNAVAILABLE", "").strip()
     # show_faq's miss signal — the model is told to answer normally after one,
     # but it sometimes echoes the marker alongside its answer.
     reply = reply.replace("FAQ_NO_MATCH", "").strip()
@@ -351,9 +382,18 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     if triggered_poll or triggered_multi_poll or triggered_ranking_poll:
         # The poll card already renders the question — never also send it as text.
         reply = ""
+    # NOTE: triggered_calculator deliberately does NOT blank `reply` here.
+    # Nothing sends it as text (the dispatch branch below doesn't), but it is
+    # what clean_reply — and therefore conversation history — is built from.
+    # Blanking it and substituting the card title wrote the literal string
+    # "Catering Estimate" into history, and within three turns the model was
+    # answering catering questions with those two words instead of calling the
+    # tool. Exactly the "[FAQ card sent]" failure, with a title instead of a
+    # bracketed stub: a label is not a sentence, and only a sentence is
+    # harmless when the model repeats it verbatim.
 
     # ── Nothing triggered and no text — fall back to a generic apology ────────
-    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history and not triggered_faq and not triggered_faq_list:
+    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history and not triggered_faq and not triggered_faq_list and not triggered_calculator:
 
         reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
 
@@ -528,6 +568,33 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         clean_reply = ""
 
 
+    elif triggered_calculator:
+        from bot.calculator.calculator_service import send_calculator_card
+        ok = await send_calculator_card(
+            room_id=room_id,
+            title=str(triggered_calculator.get("title", "")).strip(),
+            fields=triggered_calculator.get("fields", []),
+            formula=str(triggered_calculator.get("formula", "")).strip(),
+            result_label=str(triggered_calculator.get("result_label", "")).strip(),
+            subtitle=str(triggered_calculator.get("subtitle", "") or "").strip(),
+            result_unit=str(triggered_calculator.get("result_unit", "") or "").strip(),
+        )
+        if not ok:
+            # The model built something the validator refused. Say so plainly
+            # rather than leaving the turn silent — a rejected card looks
+            # identical to a bot that ignored the question.
+            clean_reply = (
+                "Sorry — I couldn't put that estimate together. "
+                "Could you tell me a bit more about what you're after?"
+            )
+            await send_text(room_id, clean_reply)
+        else:
+            # Keep the model's own lead-in ("I can help you with a catering
+            # estimate!") — it's a real sentence, so imitating it costs the
+            # customer nothing. The fallback matters just as much: an empty
+            # clean_reply becomes the literal "Got it!" in message_handler,
+            # which is the other half of the same documented bug.
+            clean_reply = clean_reply or "Sure — I can work out an estimate for that."
     elif triggered_banner:
         from bot.banner_service import send_banner_card
         await send_banner_card(

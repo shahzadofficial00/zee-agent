@@ -17,7 +17,8 @@ from db import get_pending_payment_by_user, update_payment_status
 # invocation/dispatch, and DSL/custom event routing all now live in bot/router/. ──
 from bot.router.state import (
     conversation_histories, processed_event_ids, last_orders, pending_orders,
-    order_flows, awaiting_reorder_confirmation, ensure_history_loaded, persist_history,
+    order_flows, awaiting_reorder_confirmation, awaiting_calculator_order,
+    _REORDER_AFFIRMATIONS, ensure_history_loaded, persist_history,
 )
 from bot.router.order_flow import _start_order_flow, _start_fulfillment_stage, _handle_reorder_affirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
@@ -138,6 +139,20 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
             await matrix_client.room_typing(room_id, typing_state=False)
             await _start_fulfillment_stage(sender, room_id)
         return
+
+    # ── "Shall I place that order?" after a calculator result ────────────────
+    # The order line was already built from real menu rows when the result came
+    # in, so a "yes" runs the ordinary deterministic flow — no LLM, no
+    # rebuilding the item list from conversation history.
+    if sender in awaiting_calculator_order:
+        order_line = awaiting_calculator_order.pop(sender)
+        if message.strip().lower() in _REORDER_AFFIRMATIONS:
+            await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
+            if await _start_order_flow(sender, room_id, order_line):
+                await matrix_client.room_typing(room_id, typing_state=False)
+                return
+        # Anything else (a "no", or a different question) falls through to
+        # normal handling — the offer is simply dropped.
 
     # ── Sender just declined confirmation — check if this is their "same again?" reply ──
     if sender in awaiting_reorder_confirmation:

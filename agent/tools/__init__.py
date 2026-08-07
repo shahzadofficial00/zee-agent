@@ -13,6 +13,8 @@ from agent.tools.polls.show_poll_history import show_poll_history
 from agent.tools.polls.send_ranking_poll import send_ranking_poll
 from agent.tools.faq.show_faq import show_faq
 from agent.tools.faq.show_faqs import show_faqs
+from agent.tools.calculator.send_calculator import send_calculator
+from agent.tools.menu.get_menu_prices import get_menu_prices
 
 
 
@@ -32,4 +34,6 @@ __all__ = [
     "send_ranking_poll",
     "show_faq",
     "show_faqs",
+    "send_calculator",
+    "get_menu_prices",
 ]

@@ -1,7 +1,44 @@
 from bot.matrix_client import send_text
-from bot.router.state import last_orders, order_flows, logger
+from bot.router.state import last_orders, order_flows, awaiting_calculator_order, logger
 from bot.router.ids import generate_unique_tip_id
 from db import get_payment, update_payment_status, save_review
+
+
+def _derive_order_from_inputs(inputs: list) -> tuple[str, int]:
+    """Pull (item_name, quantity) out of a calculator_result's inputs, or
+    ("", 0) if it isn't an orderable menu calculator.
+
+    `inputs` carries display labels and values only — deliberately, so the bot
+    needs no memory of the card it sent. That's enough here: the quantity is
+    the value that's a plain integer, and the item is the value that names a
+    real menu row. Matching against MENU_PRICES rather than trusting position
+    means a non-menu calculator simply yields nothing instead of inventing an
+    order for an item the cafe doesn't sell.
+
+    Exact match, not fuzzy_match_key: these values are option labels this bot
+    built from menu rows, so they either match a row or aren't a menu item at
+    all. Fuzzy matching would buy nothing and risk turning a generic
+    calculator's "Premium" tier into an order for Spanish Latte Premium.
+    """
+    from agent.state import MENU_PRICES
+
+    if not isinstance(inputs, list) or not MENU_PRICES:
+        return "", 0
+
+    item, qty = "", 0
+    for entry in inputs:
+        if not isinstance(entry, dict):
+            continue
+        value = str(entry.get("value", "")).strip()
+        if not value:
+            continue
+        if value.isdigit():
+            if not qty:
+                qty = int(value)
+            continue
+        if not item and value.lower() in MENU_PRICES:
+            item = value
+    return item, qty
 
 
 async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[bool, str | None]:
@@ -294,6 +331,79 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
         state['stage'] = 'final_confirm'
         from bot.router.order_flow import _send_final_confirm_poll
         await _send_final_confirm_poll(sender, room_id)
+        return True, None
+
+    # ── calculator_result — customer sent their estimate into the chat (JNO-236) ──
+    # Falls THROUGH to the agent with rewritten text, exactly like order_summary:
+    # the whole point of the story is that the result isn't a dead end, and
+    # "what do I do with this number" is a judgement call, not a state machine.
+    #
+    # The bot keeps no record of the card it sent — no table, no in-memory map —
+    # so this payload is the only source of labels and values. That is why the
+    # client echoes display labels rather than field keys.
+    if dsl_type == 'calculator_result':
+        data = dsl.get('data', {})
+
+        # Inbound DSL is never schema-validated, and this text goes straight
+        # into conversation history, which is persisted and re-injected into
+        # every later agent call. Cap it: an unbounded blob here would bloat
+        # SQLite and eat the model's context on every subsequent turn.
+        def _clip(v, n=80):
+            return str(v).replace("\n", " ").strip()[:n]
+
+        title = _clip(data.get('title', 'calculator'))
+        inputs = data.get('inputs', [])
+        if not isinstance(inputs, list):
+            inputs = []
+        pairs = ", ".join(
+            f"{_clip(i.get('label', ''), 40)}: {_clip(i.get('value', ''), 40)}"
+            for i in inputs[:8]
+            if isinstance(i, dict) and str(i.get('label', '')).strip()
+        )
+
+        result = " ".join(p for p in (
+            _clip(data.get('result_label', 'Result'), 40),
+            _clip(data.get('result_value', ''), 40),
+            _clip(data.get('result_unit', ''), 12),
+        ) if p).strip()
+
+        message = f"I used the {title}"
+        if pairs:
+            message += f" — {pairs}"
+        if _clip(data.get('result_value', '')):
+            message += f". {result}"
+        logger.info(f"🧮 calculator_result from {sender} | {message}")
+
+        # ── Don't let an old card derail a checkout in progress ──────────────
+        # A calculator card stays tappable in scrollback forever.
+        state = order_flows.get(sender)
+        if state:
+            nudge = {
+                "await_name":  "What name should I put on the order?",
+                "await_phone": "What's the best phone number to reach you?",
+            }.get(state.get("stage"), "Let's finish the order you've got going, then I'll pick this up.")
+            await send_text(room_id, f"Got it — {result or 'estimate noted'}.\n\n{nudge}")
+            return True, None
+
+        # ── Offer the order, deterministically ───────────────────────────────
+        # The result never reaches the LLM. Sending it there meant the model
+        # answered a calculator question with another calculator card (twice
+        # running), and a later "yes" had to rebuild the whole order through
+        # tool calls — the exact thing the deterministic order flow exists to
+        # avoid. The card was built server-side from real menu rows, so the
+        # item and quantity are already known here; the "yes" just runs
+        # _start_order_flow, same as any other order.
+        item, qty = _derive_order_from_inputs(inputs)
+        if item and qty:
+            awaiting_calculator_order[sender] = f"I want to order: {item} x{qty}"
+            await send_text(
+                room_id,
+                f"{message}\n\nShall I place that order — {qty} × {item}?"
+            )
+        else:
+            # Nothing orderable in it (a non-menu calculator, or a single-item
+            # card with no item in `inputs`). Acknowledge and stop.
+            await send_text(room_id, f"{message}\n\nWant me to turn that into an order?")
         return True, None
 
     # ── poll — the bot's own poll card being echoed back to the room ─────

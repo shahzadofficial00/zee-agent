@@ -40,6 +40,11 @@ last_order_state: dict[str, dict] = {}
 # Senders currently waiting on a yes/no reply to "want the same order again?"
 # after declining the confirmation poll — checked in handle_message.
 awaiting_reorder_confirmation: set[str] = set()
+# Senders who sent a calculator result and were asked "shall I place this
+# order?" — maps to the ready-made order line ("I want to order: Latte x20").
+# Same shape as awaiting_reorder_confirmation, but it carries the line because
+# a calculator order has no last_order_state to rebuild from.
+awaiting_calculator_order: dict[str, str] = {}
 
 _REORDER_AFFIRMATIONS = {
     "yes", "yeah", "yup", "yep", "sure", "ok", "okay", "same", "same again",

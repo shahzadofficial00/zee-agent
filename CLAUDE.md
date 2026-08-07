@@ -22,7 +22,8 @@ Restaurant Agent/
 │   │                           #   puts tests/ on sys.path instead of the root and can't
 │   │                           #   import bot/db/agent.
 │   ├── test_terms.py           # JNO-90/97/98 — 9 checks
-│   └── test_faq.py             # JNO-54/55/56 — 4 checks
+│   ├── test_faq.py             # JNO-54/55/56 — 4 checks
+│   └── test_calculator.py      # JNO-233/234-237 — 10 checks
 │                               # ⚠️ test.py and test_status.py stay at the ROOT on purpose:
 │                               #   despite the names they are manual triggers, not tests —
 │                               #   they log into Matrix and fire real events at a live room
@@ -53,12 +54,14 @@ Restaurant Agent/
 │   ├── context.py              # Context dataclass (user_id) — passed as context_schema to create_agent
 │   ├── ordering_config.py      # Master ordering switch + per-item overrides
 │   └── tools/                  # One file per agent tool, grouped by domain
-│       ├── menu/                # show_menu.py, show_item.py, show_category.py
+│       ├── menu/                # show_menu.py, show_item.py, show_category.py,
+│       │                        # get_menu_prices.py (prices AS TEXT to the model)
 │       ├── orders/              # confirm_order.py, confirm_reservation.py, show_order_history.py
 │       ├── polls/               # send_single_choice_poll.py, send_flavor_preference_poll.py,
 │       │                        # send_ranking_poll.py, send_rating_poll.py,
 │       │                        # send_special_instructions_poll.py, show_poll_history.py
 │       ├── faq/                 # show_faq.py, show_faqs.py
+│       ├── calculator/          # send_calculator.py
 │       └── show_banner.py       # Single tool, stays at root (no domain group needed)
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
@@ -103,6 +106,9 @@ Restaurant Agent/
     │   └── faq_service.py       # send_faq_card() — one card type for both FAQ stories
     ├── countdown/
     │   └── countdown_service.py # send_countdown_card() — no table, no inbound event
+    ├── calculator/
+    │   └── calculator_service.py # send_calculator_card() + the two gates
+    │                             # (validate_fields / validate_formula). No table.
     └── auction/
         ├── auction_service.py    # auction/auction_result DSL cards + create_and_send_auction() creation helper
         └── auction_scheduler.py  # Async scheduler: closes due auctions, pays out the winner, notifies every bidder
@@ -177,7 +183,8 @@ message_handler.py
                     │                               item, one shared chain_id → ONE card)
                     ├── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
                     ├── FAQ_TRIGGERED|name        → send_faq_card([one])
-                    └── FAQ_LIST_TRIGGERED        → send_faq_card(all)
+                    ├── FAQ_LIST_TRIGGERED        → send_faq_card(all)
+                    └── CALC_TRIGGERED|{json}     → send_calculator_card()
 ```
 
 **Why a deterministic order flow exists at all:** the agent has no checkpointer — every poll answer is a fresh `agent.ainvoke()` with no real memory across turns. On repeat orders in the same conversation, the LLM would start imitating its own flattened text history and silently skip a tool call (e.g. reply with the size question as plain text instead of calling `send_single_choice_poll`) instead of progressing the flow. Since "which item still needs a size/instructions/confirmation answer" is fully mechanical, that entire sequence — including calling `confirm_order` directly — is owned by code (`bot/router/order_flow.py`, driven by `bot/message_handler.py`), and only hands off to the LLM for parts that genuinely need judgment (free-form chat, reservations, or an order whose item list couldn't be parsed).
@@ -251,6 +258,8 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `terms` | v1 | Terms & conditions agreement card — text, plus a `signing_level` of `tap`/`typed`/`drawn` |
 | `terms_response` | v1 | Inbound-only: `agreed` + the `method` the device actually delivered (+ signature) |
 | `countdown` | v1 | Live countdown to a deadline (JNO-84/85). Outbound only — no inbound event, no table, no id. `ends_at` is ISO 8601 **with a UTC offset** (`datetime.now(timezone.utc).isoformat()`), same format `auction` already uses so the client parses both one way. `subtitle`/`expired_text` are omitted when empty so the client can use its own default |
+| `calculator` | v1 | Agent-configured calculator (JNO-233/237). `title`/`fields`/`formula`/`result_label` required; `subtitle`/`result_unit` omitted when empty. `fields` is 1–8 entries of `{key, label, type: number\|choice, min?, max?, required?, options?}`; a `choice` option's `value` is the **number** the formula sees, its `label` is what the customer reads. **Python never evaluates the formula** — the client does, live |
+| `calculator_result` | v1 | Inbound-only: the customer's filled-in estimate (JNO-236). Carries display **labels and values**, not field keys, because nothing server-side remembers the card that was sent |
 | `faq` | v1 | Q&A card (JNO-54). **One type covers both stories** — the client renders a single `items` entry expanded (the direct answer, JNO-55) and several as a collapsed accordion (JNO-56), so Python never picks a layout. `question`/`answer` must be **strings** — the Dart reads them as `String?` off a plain map, so a non-string throws in the cast (same class as the menu `price` bug). Answers are plain text; the widget library renders no markdown |
 | `terms_history` | v1 | Agreement history (JNO-98) — trigger card in the timeline, full list on tap. Declines included. `agreed` must be a real JSON bool, not SQLite's 0/1 |
 | `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
@@ -263,6 +272,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
 - `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
 - `terms_response` — customer agreed to / declined the order terms → records the agreement, then resumes or cancels the parked order (no LLM). See Terms & Conditions below
+- `calculator_result` — customer sent their estimate into the chat (JNO-236) → summarises it, offers the order, and a "yes" runs the deterministic order flow (no LLM). See Calculator below
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
 
 **Poll chaining (`chain_id`):** any `poll` card can carry an optional `data.chain_id`. Every poll sharing a value is drawn client-side as **one** card that advances question-to-question in place, instead of N stacked cards; the folded-in events are hidden as tiles. Omit it for a standalone question (a confirmation) so it keeps its own card. Used by:
@@ -314,6 +324,8 @@ Incoming DSL events from the client are routed by `dsl.type`:
 | `show_banner(variant, title, message, meta)` | Visual callout (outage, warning, success, info) | `"BANNER_TRIGGERED\|..."` |
 | `show_faq(question)` | A general question the fast path couldn't match — the LLM rephrases it toward a stored question | `"FAQ_TRIGGERED\|{matched question}"` or `"FAQ_NO_MATCH"` |
 | `show_faqs()` | Customer wants to browse every FAQ | `"FAQ_LIST_TRIGGERED"` |
+| `send_calculator(title, quantity_label, categories \| item_name, ...)` | An estimate depending on a quantity only the customer has (catering/bulk). **Builds the fields, options, prices and formula itself** from the live menu — the model only names categories | `"CALC_TRIGGERED\|{json}"`, or `CALC_NO_CATEGORY\|{valid names}` / `CALC_NO_ITEM\|{name}` / `CALC_MENU_UNAVAILABLE` |
+| `get_menu_prices()` | Before `send_calculator` — this is where the exact category spellings come from | `"Hot Classics: Espresso 10, Latte 30\|nCold Drinks: ..."` or `"MENU_PRICES_UNAVAILABLE"` |
 
 ### Middleware Stack (in order)
 1. **`RestaurantGuardrail`** — blocks banned keywords (prompt-injection phrases) before the LLM; checks the customer's **latest** human message
@@ -485,6 +497,47 @@ Checks: `python -m tests.test_countdown` — 3 checks covering the schema, empty
 
 ---
 
+## Calculator (JNO-233)
+
+A card the customer fills in themselves; the estimate recomputes live client-side. Four stories, one card: JNO-234 (render fields) and JNO-235 (live result) are **pure Flutter**, JNO-236 is the inbound half, JNO-237 is everything in this repo.
+
+**Python never evaluates the formula.** The client recomputes it on every keystroke, so `calculator_service.py` only decides whether a formula is safe enough to ship. That check is an `ast.parse` + node allowlist, never a regex: a charset regex passes `__import__("os").system(...)`, which is nothing but letters, underscores, quotes and parens. `ast.Pow` and `ast.Mod` are deliberately outside the allowlist — `9**9**9` is a one-token DoS on whichever runtime evaluates it, and the epic's grammar is `+ - * /` only.
+
+**Two independent gates, and Python is not the boundary.** DSL also reaches the room straight from Supabase Edge Functions, which never pass through `safe_send_dsl()` (gap #4) — on that path the Dart parser is the *only* thing between a payload and the evaluator. The client re-implements the identical grammar; neither side may assume the other ran.
+
+**The field cap is enforced three times and only two of them count.** `MAX_FIELDS = 8` in Python, `maxItems: 8` in `schema.json`, and again client-side inside `render()`. The schema copy is documentation only — quicktype drops `maxItems` from the generated model, so it enforces nothing on the client. Same for the formula: an unparseable one is a perfectly valid JSON string, so `_tryParse` sees nothing wrong. The client's working hook is throwing inside `render()`, which `dsl_event_extension.dart` catches into the standard failed card.
+
+**The model does not write the card — it names categories, the tool builds it.** `send_calculator` takes `quantity_label` plus either `categories=["Hot Classics", ...]` or `item_name="Latte"`, then reads the live `menu_items` rows and constructs the fields, the option labels, the prices and the formula itself. The model never emits a price, an item list or an expression.
+
+This replaced a version where the model passed `fields` and `formula` directly, after three rounds of prompt tuning failed in a different way each time:
+
+1. it made the *price* a customer input (`guests * item_price`, "Price per item"), so 20 coffees quoted as 40 PKR — the customer quoting themselves, rendered as if the cafe had computed it;
+2. told to use real prices, it offered 3 of 13 coffees, stranding anyone wanting a cappuccino;
+3. told to list every matching item, it listed all 17 including Mango Smoothie and Berry Mojito in a *coffee* estimate;
+4. told explicitly "every one they asked about and nothing else", it did (3) again.
+
+A prompt is not a constraint (gap #25). Category names resolve against the real `category` column, so an un-asked-for item can no longer appear and a wrong price cannot be expressed. An unknown category returns `CALC_NO_CATEGORY|` **with the valid names**, so the model self-corrects instead of guessing.
+
+The `_RATE_WORDS` guard in `validate_fields` (rejecting a `number` field labelled price/cost/rate/charge/fee) stays as a backstop for any other caller of `send_calculator_card()` — the service is still generic per JNO-237, and only the *tool* is menu-bound.
+
+**`calculator_result` never reaches the LLM.** It summarises the result, offers the order, and a plain "yes" runs `_start_order_flow()` — the same path every other order takes. The item and quantity come out of `inputs` by matching each value against `MENU_PRICES` (the integer is the quantity, the value naming a real menu row is the item), so a non-menu calculator yields nothing and no order is invented.
+
+This replaced a fall-through-to-the-agent design copied from `order_summary`. Two things went wrong with it, both fixed by not involving the LLM at all: the agent answered a calculator result with *another calculator card* (twice running — a result is a calculator question, so it reached for a calculator), and a later "yes" had to rebuild the order through tool calls, which is exactly what the deterministic order flow exists to avoid. A `suppress_calculator` flag was threaded through `handle_message` → `_dispatch_agent_result` to stop the loop; handling the event deterministically removed the loop **and** the flag.
+
+`order_summary` still falls through, correctly — it carries no result and the customer hasn't agreed to anything yet.
+
+**A literal `/ 0` is rejected at send time**; every other division-by-zero depends on runtime input and is the client's "can't calculate yet" state. That state is gated on `result.isFinite`, not on a zero-divisor check — a 1e-9 divisor overflows the same way and a zero check misses it.
+
+**`calculator_result` falls through to the agent** (`return False, message`), exactly like `order_summary` — "what do I do with this number" is judgement, not a state machine. Nothing server-side records the card that was sent, which is *why* the client echoes display labels rather than field keys: the inbound payload is the only source of them. The handler clips every field before building the text — it lands in `conversation_history`, which is persisted and re-injected into every later agent call, so an unbounded blob would eat the model's context on every subsequent turn.
+
+**…except while a checkout is open, where it is handled instead of falling through.** The fall-through re-enters `handle_message` *above* its `order_flows` check, so a customer sitting at `await_name`/`await_phone` who taps an old calculator card in scrollback would have the estimate text stored as their name or phone by `save_customer()` — onto the order and onto the receipt. The guard acknowledges the estimate, re-asks whatever the flow was waiting on, and leaves the flow untouched. This is the same stage-check every other inbound handler does; `order_summary`, which this branch was modelled on, is the exception rather than the rule, because starting a fresh order mid-flow is a legitimate thing to do.
+
+**No table, no state, no cleanup** — same shape as `countdown`. Dismissing the card sends nothing at all; a `calculator_declined` nobody consumes would be a type, a schema, an example, a generated model and a handler registration for zero behaviour.
+
+Checks: `python -m tests.test_calculator` — 10 checks: the formula gate (13 unsafe/invalid rejected), the field gate, the schema, the sender, the inbound fall-through incl. clipping, the mid-checkout guard, the history-sentinel rule, server-built options, category grouping, and the no-loop guard.
+
+---
+
 ## FAQ (JNO-54)
 
 Two stories, **one** DSL type: JNO-55 (one relevant answer) and JNO-56 (browse them all) differ only in how many `items` the card carries, and the client picks the layout. The agent sends what it selected.
@@ -512,6 +565,8 @@ The bug that cost three debugging rounds, and the reason `clean_reply` matters m
 Fixed at the source: **no dispatch branch returns a bracketed pseudo-reply any more** — `[Banner sent: …]`, `[Poll history card sent]` and `[Rating poll(s) sent for: …]` all became `""`. The FAQ branch stores the **real answer text**, so if it does get imitated the customer still gets a correct reply, just as text. `_is_history_placeholder()` remains as a backstop for rows written before the fix.
 
 Any new card-only branch must follow the same rule: whatever goes in `clean_reply` should be a sentence that is **harmless if the model repeats it verbatim**.
+
+**Third instance — the calculator, JNO-237.** The branch stored the card *title* (`clean_reply = "Catering Estimate"`), copying the poll precedent. It doesn't transfer: a poll stores its **question**, which is a sentence; a title is a label. Within three turns the model was answering catering questions with the literal words "Catering Estimate" and had stopped calling `send_calculator` — failure mode (1) and (3) at once. The branch now keeps the model's own lead-in sentence, falling back to a fixed sentence when it wrote none. **`""` is not an escape hatch**: `message_handler.py` substitutes `"Got it!"` for an empty `clean_reply`, which is failure mode (2). `tests/test_calculator.py` asserts the value is non-empty, isn't the title, and contains a space.
 
 ---
 
@@ -666,4 +721,5 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 23. **`awaiting_terms` is in-memory like every other checkout stage** — a restart while the customer has the terms card open loses the parked order (gap #5 again, not a new one). The agreement itself is safe: it's written to SQLite before the order is resumed, and the handler records consent even when there's no flow to resume.
 24. **FAQ matching is substring-only, so re-worded questions miss** — `"what payment methods do you take"` never reaches *"How can I pay?"* mechanically. The LLM layer catches some of these by rephrasing; the rest fall through to normal chat. Deliberate (see FAQ section — the fuzzy tier only ever produced wrong answers), but it means coverage is exactly what you seed.
 25. **The bot will still state facts it doesn't have** — the FAQ fast path is only authoritative for seeded questions. Everything else relies on a prompt rule, and a prompt is not a constraint. It invented "plenty of parking right outside the cafe" once. Prompt hardening reduced it (wifi/seating/catering now defer correctly), but the only deterministic fix is seeding the question. Hours and location ARE legitimately known — they're in `CAFE KNOWLEDGE` in `agent/prompt.py`.
-26. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.
+26. **The calculator's item set is only as good as the category the model picks.** Prices and option lists are now resolved server-side from `menu_items`, so neither can be wrong (see Calculator). What remains model-judgement is *which* categories a request maps to — "coffee for 40" → `["Hot Classics", "Premium Brews", "Specialty Lattes"]` is a semantic call, and picking `["Cold Drinks"]` would produce a perfectly valid card answering the wrong question. Far smaller surface than the previous gap (one category name vs. 17 hand-written options with hand-written prices), self-correcting via `CALC_NO_CATEGORY|`, and bounded — every option shown is a real item at its real price whatever it picks. Closing it entirely would need category *intent* mapping, which is the same class of problem as FAQ matching (gap #24).
+27. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.
