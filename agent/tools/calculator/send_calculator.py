@@ -9,7 +9,6 @@ async def send_calculator(
     quantity_label: str,
     result_label: str = "Estimated total",
     categories: list[str] | None = None,
-    item_name: str = "",
     choice_label: str = "Which one?",
     max_quantity: int = 200,
 ) -> str:
@@ -17,9 +16,8 @@ async def send_calculator(
     catering cost themselves.
 
     You do NOT supply prices or the item list — this tool reads both from the
-    live menu. You only say WHICH items belong in it, by naming menu categories
-    (call get_menu_prices first to see the exact category names), or by naming
-    one specific item.
+    live menu. You only say WHICH menu categories belong in it. Call
+    get_menu_prices first to see the exact category names and what's in each.
 
     Use for a cost that depends on a quantity only the customer knows
     ("coffee for 40 people", "25 lattes"). Do NOT use for a normal order (the
@@ -30,18 +28,14 @@ async def send_calculator(
         quantity_label: What they're counting, e.g. "Number of guests".
         result_label: What the answer is called, e.g. "Estimated total".
         categories: Menu categories to offer, EXACTLY as get_menu_prices spells
-            them, e.g. ["Hot Classics", "Premium Brews"]. Include every
-            category the customer asked about and none they didn't.
-        item_name: Use INSTEAD of categories when they named one item ("25
-            lattes"). Produces a single quantity field with that item's price
-            built in — no picker.
+            them, e.g. ["Hot Classics", "Premium Brews"]. Name EVERY category
+            the customer's request covers and none it doesn't — "coffee" is
+            usually several of them, not one, and never a single drink.
         choice_label: Label above the picker, e.g. "Which drink?".
         max_quantity: Largest quantity they may enter.
 
     Returns "CALC_TRIGGERED|..." — the card is sent, so reply with nothing else.
-    On "CALC_NO_CATEGORY|..." retry with a category name from that list. On
-    "CALC_NO_ITEM|..." the item isn't on the menu, so tell the customer you'll
-    check rather than guessing a price.
+    On "CALC_NO_CATEGORY|..." retry with category names from that list.
     """
     from db import get_menu_items
     from agent.state import update_menu_cache
@@ -60,37 +54,41 @@ async def send_calculator(
         "required": True,
     }
 
-    if item_name:
-        # One named item — the price is a constant, so there is nothing to pick.
-        wanted = item_name.strip().lower()
-        match = next((i for i in items if str(i["name"]).strip().lower() == wanted), None)
-        if not match:
-            return f"CALC_NO_ITEM|{item_name}"
-        fields = [quantity_field]
-        formula = f"quantity * {int(match['price'])}"
-    else:
-        # Category names are matched against the real `category` column, so the
-        # option set is exactly one or more real categories — the model cannot
-        # pad it with items the customer never asked about, which is what kept
-        # happening when it built the list itself.
-        wanted = {str(c).strip().lower() for c in (categories or []) if str(c).strip()}
-        chosen = [i for i in items if str(i.get("category", "")).strip().lower() in wanted]
-        if not chosen:
-            valid = sorted({str(i.get("category", "")).strip() for i in items if i.get("category")})
-            return "CALC_NO_CATEGORY|" + ", ".join(valid)
-        chosen.sort(key=lambda i: int(i["price"]))
-        fields = [
-            quantity_field,
-            {
-                "key": "choice",
-                "label": choice_label or "Which one?",
-                "type": "choice",
-                "required": True,
-                # Prices come straight off the menu row — never from the model.
-                "options": [{"label": str(i["name"]), "value": int(i["price"])} for i in chosen],
-            },
-        ]
-        formula = "quantity * choice"
+    # Categories only — there is deliberately no single-item mode. It existed,
+    # and the model used it to answer "calculate 20 coffee" with
+    # item_name="Latte": a general request collapsed to one drink, priced at 30
+    # while espresso is 10 and Spanish Latte Premium is 1999, with the item
+    # named nowhere on the card. `inputs` then echoed back no item either, so
+    # _derive_order_from_inputs found nothing, no order was offered, and the
+    # customer's "yes" reached the LLM — which replied with a second calculator.
+    # Once a named item expanded to its category (so a narrowed guess stayed
+    # correctable), that mode did nothing `categories` doesn't, except guess the
+    # category indirectly via whichever item the model happened to name.
+    #
+    # Category names are matched against the real `category` column, so the
+    # option set is exactly one or more real categories — the model cannot pad
+    # it with items the customer never asked about, and cannot narrow it below
+    # a category either. "25 lattes" gets the Hot Classics picker with Latte in
+    # it, which is what the item-name path ended up producing anyway.
+    wanted = {str(c).strip().lower() for c in (categories or []) if str(c).strip()}
+    chosen = [i for i in items if str(i.get("category", "")).strip().lower() in wanted]
+    if not chosen:
+        valid = sorted({str(i.get("category", "")).strip() for i in items if i.get("category")})
+        return "CALC_NO_CATEGORY|" + ", ".join(valid)
+    chosen.sort(key=lambda i: int(i["price"]))
+
+    fields = [
+        quantity_field,
+        {
+            "key": "choice",
+            "label": choice_label or "Which one?",
+            "type": "choice",
+            "required": True,
+            # Prices come straight off the menu row — never from the model.
+            "options": [{"label": str(i["name"]), "value": int(i["price"])} for i in chosen],
+        },
+    ]
+    formula = "quantity * choice"
 
     payload = {
         "title": title,

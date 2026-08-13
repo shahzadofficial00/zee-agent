@@ -565,7 +565,13 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     elif triggered_poll_history:
         from bot.polls.poll_history_service import send_poll_history_card
         await send_poll_history_card(matrix_client, room_id, sender)
-        clean_reply = ""
+        # Never "" — message_handler turns an empty clean_reply into the literal
+        # "Got it!", which lands in history as this turn's answer. Observed live:
+        # "Send poll history" was answered "Got it!", and the summariser then
+        # hardened that into "poll history ... not a supported functionality",
+        # re-injected on every later turn. Whatever goes here has to be a
+        # sentence that is harmless if the model repeats it verbatim.
+        clean_reply = clean_reply or "Here's your poll history."
 
 
     elif triggered_calculator:
@@ -604,7 +610,11 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
             message=triggered_banner["message"],
             meta=triggered_banner["meta"],
         )
-        clean_reply = ""
+        # Same rule as the poll-history branch above: an empty clean_reply
+        # becomes "Got it!" in history. The banner's own title/message are
+        # already real sentences, so fall back to the message itself.
+        clean_reply = clean_reply or str(triggered_banner.get("message") or "").strip() \
+            or "Just so you know —"
     else:
         await send_text(room_id, reply)
 

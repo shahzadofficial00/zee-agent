@@ -40,7 +40,7 @@ TERMS_TITLE = "Order Terms"
 #   "drawn" → signature canvas        → signature stored as a base64 PNG
 # The client falls back drawn → typed → tap if the device can't manage the
 # level asked for, so what actually happened is stored as `method`, not this.
-TERMS_SIGNING_LEVEL = "typed"
+TERMS_SIGNING_LEVEL = "tap"
 
 # Options: True | False
 #   True  → card shows a Decline button

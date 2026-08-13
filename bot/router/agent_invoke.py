@@ -38,7 +38,7 @@ async def _invoke_agent_with_retry(messages, sender: str, retries: int = 4):
     for attempt in range(retries + 1):
         result = await asyncio.wait_for(
             agent.ainvoke({"messages": messages}, context=Context(user_id=sender)),
-            timeout=30.0,
+            timeout=50.0,
         )
         if not _is_empty_agent_response(result):
             return result

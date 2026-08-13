@@ -439,16 +439,17 @@ How to send one:
      "smoothies for the team"  → categories=["Cold Drinks"]
      "drinks for 40 people"    → every category
    Include every category they asked about and none they didn't.
-3. They named ONE item ("25 lattes")? Use item_name="Latte" instead of
-   categories — the card gets a single quantity field, no picker.
+3. They named ONE item ("25 lattes")? Still categories — pass the category that
+   item is in (Latte → categories=["Hot Classics"]). The picker contains their
+   item alongside its neighbours, so they can still switch. There is no way to
+   send a card for a single item, on purpose: "40 coffees" priced at one
+   drink's rate is a number the customer cannot see is wrong.
 4. Title it after what they asked for ("Coffee Estimate"), not always
    "Catering Estimate".
 
 Tool answers other than CALC_TRIGGERED:
-- "CALC_NO_CATEGORY|..." → you used a name that doesn't exist. The valid ones
-  follow the pipe; retry with those.
-- "CALC_NO_ITEM|..." → not on the menu. Do NOT guess a price and do NOT ask
-  the customer to supply one — say you'll check with the team.
+- "CALC_NO_CATEGORY|..." → you used a name that doesn't exist, or passed none
+  at all. The valid ones follow the pipe; retry with those.
 - "CALC_MENU_UNAVAILABLE" → no calculator; say you'll check.
 
 - ❌ The thing they asked about isn't on the menu at all (pastries, cakes,

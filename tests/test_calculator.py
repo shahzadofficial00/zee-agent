@@ -301,6 +301,16 @@ async def test_dispatch_never_writes_a_label_into_history():
     from bot.router import agent_dispatch as ad
     from bot.calculator import calculator_service as cs
 
+    # The rule applies to EVERY card-only branch, not just this one. Checked at
+    # source level because that catches branches this test doesn't drive:
+    # poll-history and banner both shipped `clean_reply = ""`, and live that
+    # made "Send poll history" answer "Got it!", which the summariser then
+    # hardened into "poll history is not a supported functionality".
+    import inspect, re as _re
+    src = inspect.getsource(ad)
+    assert not _re.search(r'clean_reply\s*=\s*([\'"])\1\s*$', src, _re.M), \
+        'a dispatch branch assigns an empty clean_reply — message_handler turns that into "Got it!"'
+
     async def fake_send(room_id, message_type=None, content=None, **kw):
         return type("R", (), {"event_id": "$e"})()
 
@@ -392,22 +402,35 @@ async def test_options_come_from_the_menu_not_the_model():
         data = _json.loads(out.split("|", 1)[1])
         assert len(data["fields"][1]["options"]) == 5
 
-        # A named item → one field, price inlined, no single-option picker.
-        out = await send_calculator.ainvoke({
-            "title": "Latte Estimate", "quantity_label": "Number of lattes",
-            "item_name": "latte",
-        })
-        data = _json.loads(out.split("|", 1)[1])
-        assert len(data["fields"]) == 1, "a named item should not get a picker"
-        assert data["formula"] == "quantity * 30", data["formula"]
+        # There is no single-item mode, and adding one back must fail here.
+        # Observed live: item_name="Latte" answered "calculate 20 coffee" with
+        # `quantity * 30` and the item named nowhere on the card, so it priced
+        # every coffee at Latte's 30 AND echoed back no item — which left
+        # _derive_order_from_inputs empty and sent the customer's "yes" to the
+        # LLM, which replied with a second calculator.
+        assert "item_name" not in send_calculator.args, \
+            "single-item mode is back — it lets the model narrow a category to one price"
 
-        # Unknown category / item / menu → recoverable markers, never a card.
+        # Every card is a category card: quantity + a real picker, always.
+        for kwargs in (
+            {"categories": ["Hot Classics"]},
+            {"categories": ["Hot Classics", "Cold Drinks"]},
+        ):
+            data = _json.loads((await send_calculator.ainvoke(
+                {"title": "T", "quantity_label": "n", **kwargs})).split("|", 1)[1])
+            assert data["formula"] == "quantity * choice", data["formula"]
+            choice = next(f for f in data["fields"] if f["type"] == "choice")
+            # Labels are what come back in `inputs`, so the order path sees them.
+            assert {o["label"].lower() for o in choice["options"]} <= \
+                {m["name"].lower() for m in MENU}, choice
+
+        # No categories at all → the recoverable marker, never a card.
+        out = await send_calculator.ainvoke({"title": "X", "quantity_label": "n"})
+        assert out.startswith("CALC_NO_CATEGORY|") and "Hot Classics" in out, out
+        # Unknown category → same, with the valid names to retry from.
         out = await send_calculator.ainvoke({
             "title": "X", "quantity_label": "n", "categories": ["Pastries"]})
         assert out.startswith("CALC_NO_CATEGORY|") and "Hot Classics" in out, out
-        out = await send_calculator.ainvoke({
-            "title": "X", "quantity_label": "n", "item_name": "Croissant"})
-        assert out.startswith("CALC_NO_ITEM|"), out
     finally:
         restore()
 

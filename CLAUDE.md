@@ -7,7 +7,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - **Bot user:** `@dot_cafe:jaeno.ai`
 - **Matrix server:** `https://chat.jaeno.ai`
 - **Room:** `!NyMqNOqWDDsZLJsVAA:jaeno.ai`
-- **LLM:** Gemini 2.5 Flash via LangChain/LangGraph
+- **LLM:** Gemini 2.5 Flash via OpenRouter (OpenAI-compatible client), LangChain/LangGraph
 
 ---
 
@@ -23,7 +23,8 @@ Restaurant Agent/
 │   │                           #   import bot/db/agent.
 │   ├── test_terms.py           # JNO-90/97/98 — 9 checks
 │   ├── test_faq.py             # JNO-54/55/56 — 4 checks
-│   └── test_calculator.py      # JNO-233/234-237 — 10 checks
+│   ├── test_calculator.py      # JNO-233/234-237 — 10 checks
+│   └── test_menu.py            # Local menu — 4 checks (seed, int price, fields, idempotence)
 │                               # ⚠️ test.py and test_status.py stay at the ROOT on purpose:
 │                               #   despite the names they are manual triggers, not tests —
 │                               #   they log into Matrix and fire real events at a live room
@@ -36,7 +37,7 @@ Restaurant Agent/
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
 │   ├── orders.py               # Orders + reservations
 │   ├── customers.py            # Saved name/phone lookup
-│   ├── menu.py                 # Menu items + ordering on/off switches
+│   ├── menu.py                 # Menu items (local, + the _SEED_MENU constant) + ordering switches
 │   ├── payments.py             # Supabase payment_intents CRUD
 │   ├── reviews.py               # Supabase reviews + review queue
 │   ├── polls.py                 # Polls, poll answers, item ratings
@@ -200,7 +201,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 |---|---|
 | `orders` | Customer orders (name, phone, items, total, status, room_id, stable_order_id, fulfillment_method, fulfillment_summary) |
 | `reservations` | Table bookings |
-| `menu_items` | Menu (local cache) |
+| `menu_items` | **The** menu — authoritative. Was Supabase; moved local so browsing and pricing don't need the network. Seeded from `_SEED_MENU` in `db/menu.py` only when empty (same rule as `faqs`), which is the only git-tracked copy since `restaurant.db` is gitignored |
 | `settings` | Key/value store (ordering_enabled flag) |
 | `item_ordering` | Per-item ordering overrides |
 | `customers` | Per-user saved name/phone (`get_customer`/`save_customer`) |
@@ -219,7 +220,6 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `payment_intents` | Payment records for orders, tips, AND auction winners (created by Supabase Edge Function), keyed by `order_id` (`ORD-XXXXXX`, `TIP-XXXXXX`, or `AUC-XXXXXX`) |
 | `reviews` | Customer reviews |
 | `review_queue` | Scheduled review card sends |
-| `menu_items` | Authoritative menu source (fetched by agent at order time) |
 
 Orders are saved to SQLite first, then a `stable_order_id` (e.g. `ORD-AB1C2D`) is generated and linked to the Supabase payment intent. Tips reuse the exact same `payment_intents` mechanism with a `TIP-XXXXXX` id instead — no separate tips table. Auction winners reuse it again with the auction's own `AUC-XXXXXX` id as the `order_id` — the auction_id IS the payment order_id, no separate ID generation needed.
 
@@ -285,7 +285,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 
 **The client no longer requires the previous question to be answered before folding.** That condition was dropped app-side (`poll_chain.dart`) so the bot can fire a whole batch at once and forget it — which is what the rating polls do at `ORDER_SAVED`, rather than sequencing sends against inbound `poll_response` events (in-memory state that wouldn't survive a restart, gap #5). Consequence: **a chain_id collision now silently merges unrelated cards.** Ratings use the `rate_` prefix precisely so they don't land in the finished checkout chain. Any new chained sender needs its own namespace.
 
-**Item descriptions:** `menu` v2 / `menu_category` nested items and the `menu_item` card all carry a `description` string, sourced from the Supabase `menu_items.description` column. The Flutter grid card and item-detail screen read `item['description']` straight off the map (no generated model for nested items), so the schema tells you nothing about what the client renders there — check the Dart. Known gap: `_HighlightedItemCard` (the `menu_item` v1 card) takes `description` as a constructor param and never renders it, so that one card still shows nothing.
+**Item descriptions:** `menu` v2 / `menu_category` nested items and the `menu_item` card all carry a `description` string, sourced from the SQLite `menu_items.description` column. The Flutter grid card and item-detail screen read `item['description']` straight off the map (no generated model for nested items), so the schema tells you nothing about what the client renders there — check the Dart. Known gap: `_HighlightedItemCard` (the `menu_item` v1 card) takes `description` as a constructor param and never renders it, so that one card still shows nothing.
 
 **Gotcha already hit and fixed:** `menu`/`menu_category`'s nested item `price` field must be a **string** (`str(i["price"])`), matching `menu_item_card_data`'s convention and what the Dart-generated model (`MenuV2Item.price: String`) expects — `send_menu()`/`send_category_card()` were sending the raw SQLite/Supabase numeric value, which passed Python-side schema validation (the nested `menu_item` def had no type constraint on `price`) but threw on the client's stricter generated parser, silently falling back to an "Unsupported" card. `schema.json` now explicitly types it `string` too, so `safe_send_dsl()` catches this class of bug server-side going forward.
 
@@ -298,10 +298,12 @@ Incoming DSL events from the client are routed by `dsl.type`:
 ## Agent
 
 ### LLM
-- **Model:** `gemini-2.5-flash`
+- **Provider:** OpenRouter, reached with `ChatOpenAI` (`langchain_openai`) pointed at `https://openrouter.ai/api/v1`. OpenRouter speaks the OpenAI wire format, so it's the same client class with a different `base_url` — no OpenAI account involved. The previous direct `ChatGoogleGenerativeAI` config is kept commented at the top of `agent/llm.py` rather than deleted.
+- **Model:** `OPENROUTER_MODEL`, defaulting to `google/gemini-2.5-flash`. Swapping models is an `.env` edit plus a restart — but a model change is a behavior change, and this agent's tool-calling is what everything downstream depends on. Re-run the checks before trusting a swap.
 - **Temperature:** 0.4
-- **Rate limit:** 2.0 req/s, max bucket 10 (`agent/llm.py`). Sized for a paid Tier 1 key (150–300 RPM); 2.0 rps = 120 RPM leaves ~20% headroom under the low end. The limiter counts requests *it* issues, not the SDK's internal retries, and one customer message costs 2–3 requests (model → tool → model) — so this is ~40–50 messages/min, not 120. Raise to 4.0 if AI Studio's quota page shows 300 RPM for the project.
-- **Reasoning:** disabled (`thinking_budget=0`)
+- **`max_tokens=2048`** — load-bearing, not a guess. OpenRouter reserves credits against `max_tokens` up front; unset it defaults to the model's full 65535 window, and the reservation alone returns **402** on a low balance even when the actual reply is 200 tokens.
+- **Rate limit:** 2.0 req/s, max bucket 10 (`agent/llm.py`). The limiter counts requests *it* issues, not the client's internal retries, and one customer message costs 2–3 requests (model → tool → model) — so this is ~40–50 messages/min, not 120. Under OpenRouter the real ceiling is your credit balance and the upstream provider's limits, not a per-project RPM quota.
+- **Reasoning:** the old `thinking_budget=0` was a `ChatGoogleGenerativeAI` argument and does **not** exist on `ChatOpenAI` — it's gone, not ported. If the routed model reasons by default, that's now unbounded; OpenRouter's `reasoning` field is the knob, passed via `extra_body`.
 
 ### Tools
 
@@ -324,7 +326,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 | `show_banner(variant, title, message, meta)` | Visual callout (outage, warning, success, info) | `"BANNER_TRIGGERED\|..."` |
 | `show_faq(question)` | A general question the fast path couldn't match — the LLM rephrases it toward a stored question | `"FAQ_TRIGGERED\|{matched question}"` or `"FAQ_NO_MATCH"` |
 | `show_faqs()` | Customer wants to browse every FAQ | `"FAQ_LIST_TRIGGERED"` |
-| `send_calculator(title, quantity_label, categories \| item_name, ...)` | An estimate depending on a quantity only the customer has (catering/bulk). **Builds the fields, options, prices and formula itself** from the live menu — the model only names categories | `"CALC_TRIGGERED\|{json}"`, or `CALC_NO_CATEGORY\|{valid names}` / `CALC_NO_ITEM\|{name}` / `CALC_MENU_UNAVAILABLE` |
+| `send_calculator(title, quantity_label, categories, ...)` | An estimate depending on a quantity only the customer has (catering/bulk). **Builds the fields, options, prices and formula itself** from the live menu — the model only names categories | `"CALC_TRIGGERED\|{json}"`, or `CALC_NO_CATEGORY\|{valid names}` / `CALC_MENU_UNAVAILABLE` |
 | `get_menu_prices()` | Before `send_calculator` — this is where the exact category spellings come from | `"Hot Classics: Espresso 10, Latte 30\|nCold Drinks: ..."` or `"MENU_PRICES_UNAVAILABLE"` |
 
 ### Middleware Stack (in order)
@@ -335,7 +337,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 5. **`ModelCallLimitMiddleware`** — caps a single `agent.ainvoke()` run at 10 model calls (`exit_behavior="end"`)
 6. **`ToolCallLimitMiddleware`** — caps a single run at 10 tool calls (`exit_behavior="continue"`)
 
-There is intentionally **no separate model-retry middleware** — the Gemini SDK's own `max_retries=4` (in `agent/llm.py`) already covers 429/5xx/network errors with its own backoff; a `ModelRetryMiddleware` layer was removed because its up-to-120s backoff schedule was getting killed mid-retry by the outer 30s timeout in `_invoke_agent_with_retry` (`message_handler.py`), causing the whole call to restart from scratch instead of completing one clean retry.
+There is intentionally **no separate model-retry middleware** — the client's own `max_retries=6` (in `agent/llm.py`) already covers 429/5xx/network errors with its own backoff; a `ModelRetryMiddleware` layer was removed because its up-to-120s backoff schedule was getting killed mid-retry by the outer timeout in `_invoke_agent_with_retry` (`bot/router/agent_invoke.py`), causing the whole call to restart from scratch instead of completing one clean retry. That timeout is **50s** (was 30s) — OpenRouter adds a routing hop in front of the upstream provider, so the old budget was cutting off calls that would have completed.
 
 No checkpointer is configured — every turn is a fresh `agent.ainvoke()` call with `context=Context(user_id=sender)`; there is no cross-turn agent memory beyond what `message_handler.py` manually re-injects as message history.
 
@@ -467,7 +469,7 @@ Inbound `terms_response` is a trust boundary (inbound DSL is never schema-valida
 
 A decline is recorded but does **not** satisfy the gate (`agreed = 1` only), and a later agreement upgrades that same row rather than leaving a stale `declined` record shadowing real consent.
 
-**Agreement history (JNO-98)** — `send_terms_history_card(room_id, user_id)` builds the list from `db.get_agreements()`. Triggered by a fast-path pattern in `message_handler.py` ("my agreements", "agreement history", "what did i agree to"), no LLM, same shape as the order-history fast path. Declines are included on purpose. Signature blobs are **not** sent — `get_agreements()` omits them, since a base64 PNG per row would dwarf the rest of the payload. Capped at 20 rows: every `body` rides along in one Matrix event, which dies past ~64KB.
+**Agreement history (JNO-98)** — `send_terms_history_card(room_id, user_id)` builds the list from `db.get_agreements()`. Triggered by `_TERMS_HISTORY_PATTERN` in `message_handler.py` ("my agreements", "agreement history", "what did i agree to"), no LLM, same shape as the order-history fast path. Singular forms are matched too (`terms?`, `agreements?`): "term history" missed it, reached the agent, and was answered *"I can't show you a term history"* — a false capability claim that then persisted through the summary (see FAQ → card-only turns). The pattern sits at **module scope**, unlike the other fast paths, so `tests/test_terms.py` asserts against the shipped regex instead of a copy that could drift from it. Declines are included on purpose. Signature blobs are **not** sent — `get_agreements()` omits them, since a base64 PNG per row would dwarf the rest of the payload. Capped at 20 rows: every `body` rides along in one Matrix event, which dies past ~64KB.
 
 **The `body` snapshot (JNO-97)** — `agreements.body` holds the exact text the customer was shown, written at sign time and never joined from a versions table. Duplicating it per agreement is the point: the row is then immune to any later edit of `TERMS_BODY`, which is what makes it a consent record rather than a timestamp.
 
@@ -507,7 +509,7 @@ A card the customer fills in themselves; the estimate recomputes live client-sid
 
 **The field cap is enforced three times and only two of them count.** `MAX_FIELDS = 8` in Python, `maxItems: 8` in `schema.json`, and again client-side inside `render()`. The schema copy is documentation only — quicktype drops `maxItems` from the generated model, so it enforces nothing on the client. Same for the formula: an unparseable one is a perfectly valid JSON string, so `_tryParse` sees nothing wrong. The client's working hook is throwing inside `render()`, which `dsl_event_extension.dart` catches into the standard failed card.
 
-**The model does not write the card — it names categories, the tool builds it.** `send_calculator` takes `quantity_label` plus either `categories=["Hot Classics", ...]` or `item_name="Latte"`, then reads the live `menu_items` rows and constructs the fields, the option labels, the prices and the formula itself. The model never emits a price, an item list or an expression.
+**The model does not write the card — it names categories, the tool builds it.** `send_calculator` takes `quantity_label` plus `categories=["Hot Classics", ...]`, then reads the live `menu_items` rows and constructs the fields, the option labels, the prices and the formula itself. The model never emits a price, an item list or an expression. **Categories are the only selector** — there is no single-item mode, see below.
 
 This replaced a version where the model passed `fields` and `formula` directly, after three rounds of prompt tuning failed in a different way each time:
 
@@ -517,6 +519,12 @@ This replaced a version where the model passed `fields` and `formula` directly, 
 4. told explicitly "every one they asked about and nothing else", it did (3) again.
 
 A prompt is not a constraint (gap #25). Category names resolve against the real `category` column, so an un-asked-for item can no longer appear and a wrong price cannot be expressed. An unknown category returns `CALC_NO_CATEGORY|` **with the valid names**, so the model self-corrects instead of guessing.
+
+**`item_name` was the hole in that, and it produced failure (1) again in production — so it was removed (2026-08-13).** Asked to "calculate 20 coffee" the model called `send_calculator(item_name="Latte")` — a general request narrowed to one drink. That branch answered with a bare quantity field and `formula = "quantity * 30"`, so a card titled *Coffee Estimate* priced every coffee at Latte's 30 (espresso is 10, Spanish Latte Premium 1999) **without naming the item anywhere on the card**. The customer cannot see that as wrong. Worse, `inputs` then echoed back no item, `_derive_order_from_inputs` returned `("", 0)`, no order was offered, and the "yes" fell through to the LLM — which answered it with a *second calculator card*, the exact loop this section says was designed out.
+
+Both symptoms were one cause: `item_name` was the only card the bot builds whose result carries no item. Every card is now a category card — quantity plus a real picker, `formula` always `"quantity * choice"`, no branch folding a price into an expression. That makes every calculator orderable **by construction** rather than by convention, since the option labels are what come back in `inputs`.
+
+Expanding `item_name` to its category siblings was tried first and worked, but then did nothing `categories` doesn't — except pick the category *indirectly*, via whichever item the model happened to name, which is the same judgement call with less information. A single-item request is a category request: "25 lattes" → `categories=["Hot Classics"]`, and Latte is in the picker with its neighbours. `tests/test_calculator.py` asserts `item_name` is not in `send_calculator.args`, so re-adding it fails the suite.
 
 The `_RATE_WORDS` guard in `validate_fields` (rejecting a `number` field labelled price/cost/rate/charge/fee) stays as a backstop for any other caller of `send_calculator_card()` — the service is still generic per JNO-237, and only the *tool* is menu-bound.
 
@@ -566,6 +574,8 @@ Fixed at the source: **no dispatch branch returns a bracketed pseudo-reply any m
 
 Any new card-only branch must follow the same rule: whatever goes in `clean_reply` should be a sentence that is **harmless if the model repeats it verbatim**.
 
+**Fourth and fifth instances — poll history and banner, caught in production 2026-08-13.** Both still assigned `clean_reply = ""`, which is failure mode (2), not a fix for it. Live, `"Send poll history"` was answered `"Got it!"`; the summariser then compressed that turn into *"'poll history' and 'term history' … are not supported functionalities"* — and since summaries are re-injected on every later turn, the bot went on asserting a real, registered tool didn't exist. That is gap #27 with a false **capability** claim rather than a false fact, and it outlives the turn that caused it. Both branches now keep the model's own sentence with a plain fallback (`"Here's your poll history."`, the banner's own `message`). `tests/test_calculator.py` now asserts at **source level** that no branch in `agent_dispatch.py` assigns an empty `clean_reply`, which covers branches no test drives — the two above were exactly that.
+
 **Third instance — the calculator, JNO-237.** The branch stored the card *title* (`clean_reply = "Catering Estimate"`), copying the poll precedent. It doesn't transfer: a poll stores its **question**, which is a sentence; a title is a label. Within three turns the model was answering catering questions with the literal words "Catering Estimate" and had stopped calling `send_calculator` — failure mode (1) and (3) at once. The branch now keeps the model's own lead-in sentence, falling back to a fixed sentence when it wrote none. **`""` is not an escape hatch**: `message_handler.py` substitutes `"Got it!"` for an empty `clean_reply`, which is failure mode (2). `tests/test_calculator.py` asserts the value is non-empty, isn't the title, and contains a space.
 
 ---
@@ -605,7 +615,9 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 
 | Variable | Purpose |
 |---|---|
-| `GOOGLE_API_KEY` | Gemini API key |
+| `OPENROUTER_API_KEY` | OpenRouter key — **the live LLM credential** |
+| `OPENROUTER_MODEL` | Model slug, e.g. `google/gemini-2.5-flash`. Defaults to that if unset |
+| `GOOGLE_API_KEY` | **Unused.** Only the commented-out direct-Gemini block in `agent/llm.py` reads it. Kept so switching back is an uncomment, not a re-key |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_KEY` | Supabase service key |
 | `SUPABASE_ANON_KEY` | Supabase anon key (for REST calls) |
@@ -615,7 +627,9 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 | `REVIEW_CARD_ENABLED` | `"true"` / `"false"` (default `"true"`) |
 | `ONLINE_PAYMENTS_ENABLED` | Master Swich kill switch — default `"false"`. See Cash-Only Mode |
 | `TIPS_ENABLED` | Post-order tip card on/off — default `"false"`. See Cash-Only Mode |
-| `LANGCHAIN_API_KEY` | LangSmith tracing key |
+| `LANGSMITH_API_KEY` | LangSmith tracing key. (`LANGCHAIN_API_KEY` is the legacy alias and still works — `.env` uses the `LANGSMITH_*` names) |
+| `LANGSMITH_TRACING` | `"true"` / `"false"`. ⚠️ Currently **ignored**: `message_handler.py` passes `enabled=True` to `ls.tracing_context()` explicitly, so setting this `false` does not turn tracing off. Pass `enabled=None` to make the env var the switch |
+| `LANGSMITH_PROJECT` | Also **ignored** — the same call hardcodes `project_name="dot-cafe-bot"` |
 
 ---
 
@@ -681,7 +695,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 
 - **Signal strings** — tools return sentinel strings (e.g. `PAYMENT_TRIGGERED|...`) instead of side effects; `bot/router/agent_dispatch.py` parses them and dispatches. This keeps tools pure and testable.
 - **Deterministic order flow over LLM tool-calling** — every step of checkout (size, instructions, customer-info reuse, final confirmation, placing the order) is driven by explicit code (`bot/router/order_flow.py`), not the LLM deciding to call a tool each turn. This was a deliberate fix: with no checkpointer, the LLM would silently drop tool calls (replying with plain text instead of sending a poll card) on repeat orders in the same conversation. The LLM is only in the loop for genuinely open-ended parts (menu Q&A, reservations, free-form chat, or an order whose item list can't be parsed).
-- **Split DB** — orders/reservations in SQLite (always available, no network), payments/reviews in Supabase (need real-time access from mobile clients).
+- **Split DB** — orders/reservations/menu in SQLite (always available, no network), payments/reviews in Supabase (need real-time access from mobile clients). The menu moved local last: it was the one thing a customer could hit before saying a word, so a Supabase blip meant "menu is not available right now" on first contact, and `confirm_order` priced off that same fetch.
 - **Domain-grouped packages over flat directories** — `bot/`, `agent/tools/`, and `db.py` were reorganized (this session) into subfolders/files per domain (polls, menu, orders, payment, reviews, auction) instead of one flat pile of same-level files. Every move was a pure relocation — function bodies copied verbatim, cross-references rewired, public import surface (`from db import X`, `from bot.message_handler import handle_message`, etc.) kept unchanged — verified by actually importing every module afterward, not just checking syntax.
 - **stable_order_id** — a human-readable ID (`ORD-XXXXXX`, or `TIP-XXXXXX` for tips) separate from the SQLite auto-increment, used as the Supabase payment intent key.
 - **Poll chaining is fire-and-forget, enforced client-side** — the bot sends all N chained polls at once and never tracks which have been answered. The alternative (send one, wait for its `poll_response`, send the next) is another per-user state machine in `order_flows`, which is in-memory only and would strand a customer mid-ratings on any restart. The cost is that collision-avoidance is now pure convention — see gap #21.
@@ -721,5 +735,5 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 23. **`awaiting_terms` is in-memory like every other checkout stage** — a restart while the customer has the terms card open loses the parked order (gap #5 again, not a new one). The agreement itself is safe: it's written to SQLite before the order is resumed, and the handler records consent even when there's no flow to resume.
 24. **FAQ matching is substring-only, so re-worded questions miss** — `"what payment methods do you take"` never reaches *"How can I pay?"* mechanically. The LLM layer catches some of these by rephrasing; the rest fall through to normal chat. Deliberate (see FAQ section — the fuzzy tier only ever produced wrong answers), but it means coverage is exactly what you seed.
 25. **The bot will still state facts it doesn't have** — the FAQ fast path is only authoritative for seeded questions. Everything else relies on a prompt rule, and a prompt is not a constraint. It invented "plenty of parking right outside the cafe" once. Prompt hardening reduced it (wifi/seating/catering now defer correctly), but the only deterministic fix is seeding the question. Hours and location ARE legitimately known — they're in `CAFE KNOWLEDGE` in `agent/prompt.py`.
-26. **The calculator's item set is only as good as the category the model picks.** Prices and option lists are now resolved server-side from `menu_items`, so neither can be wrong (see Calculator). What remains model-judgement is *which* categories a request maps to — "coffee for 40" → `["Hot Classics", "Premium Brews", "Specialty Lattes"]` is a semantic call, and picking `["Cold Drinks"]` would produce a perfectly valid card answering the wrong question. Far smaller surface than the previous gap (one category name vs. 17 hand-written options with hand-written prices), self-correcting via `CALC_NO_CATEGORY|`, and bounded — every option shown is a real item at its real price whatever it picks. Closing it entirely would need category *intent* mapping, which is the same class of problem as FAQ matching (gap #24).
+26. **The calculator's item set is only as good as the category the model picks.** *(Narrowed 2026-08-13: `item_name` is gone, so the model can no longer collapse a general request to one silently-priced item — see Calculator. What's left is the category choice itself, and note `CALC_NO_CATEGORY|` only catches names that don't **exist** — a valid-but-wrong category, "coffee" → `["Cold Drinks"]`, still produces a perfectly good card answering the wrong question. It is at least visible: every option is a real item at its real price, so the customer can see the list is wrong and say so. Closing it entirely needs intent→category mapping — a keyword column on `menu_items` is the obvious shape — which is the same class of problem as FAQ matching (gap #24). Not built: the failure is now cosmetic and self-correcting, and tagging would move the judgement rather than delete it.)* Prices and option lists are resolved server-side from `menu_items`, so neither can be wrong. What remains model-judgement is *which* categories a request maps to — "coffee for 40" → `["Hot Classics", "Premium Brews", "Specialty Lattes"]` is a semantic call. Far smaller surface than the original gap (one category name vs. 17 hand-written options with hand-written prices), and bounded — every option shown is a real item at its real price whatever it picks.
 27. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.

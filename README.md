@@ -4,7 +4,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 
 - **Bot user:** `@dot_cafe:jaeno.ai`
 - **Matrix server:** `https://chat.jaeno.ai`
-- **LLM:** Gemini 2.5 Flash via LangChain/LangGraph
+- **LLM:** Gemini 2.5 Flash via OpenRouter, on LangChain/LangGraph (swap models with `OPENROUTER_MODEL`)
 
 ## Features
 
@@ -41,7 +41,7 @@ Restaurant Agent/
 │   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py / faqs.py
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
-│   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
+│   ├── llm.py                  # OpenRouter (OpenAI-compatible) client + rate limiter
 │   ├── tools/                  # One file per agent tool, grouped into menu/, orders/, polls/ (+ show_banner.py at root)
 │   ├── prompt.py                # System prompt for "Zee"
 │   ├── middleware.py           # Guardrails, summarization, retry, PII, call limits
@@ -110,7 +110,8 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 
 | Variable | Purpose |
 |---|---|
-| `GOOGLE_API_KEY` | Gemini API key |
+| `OPENROUTER_API_KEY` | OpenRouter key — this is the LLM credential |
+| `OPENROUTER_MODEL` | Model slug (default `google/gemini-2.5-flash`) |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_KEY` | Supabase service key |
 | `SUPABASE_ANON_KEY` | Supabase anon key (for REST calls) |
@@ -120,13 +121,15 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 | `REVIEW_CARD_ENABLED` | `"true"` / `"false"` (default `"true"`) |
 | `ONLINE_PAYMENTS_ENABLED` | Master Swich kill switch — default `"false"` (cash-only) |
 | `TIPS_ENABLED` | Post-order tip card on/off — default `"false"` |
-| `LANGCHAIN_API_KEY` | LangSmith tracing key |
+| `LANGSMITH_API_KEY` | LangSmith tracing key (`LANGCHAIN_API_KEY` is the legacy alias) |
 
 ## Database
 
-**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, menu cache, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids, conversation history, signed agreements, FAQs.
+**SQLite** (`restaurant.db`) — local, synchronous: orders, reservations, **the menu**, settings, per-item ordering overrides, customers (name/phone), polls, poll answers, item ratings, auctions, auction bids, conversation history, signed agreements, FAQs.
 
-**Supabase** — remote, async: payment intents (orders and tips), reviews, review queue, authoritative menu source.
+**Supabase** — remote, async: payment intents (orders and tips), reviews, review queue.
+
+The menu was the last thing to move local. `restaurant.db` is gitignored, so `_SEED_MENU` in `db/menu.py` is the only tracked copy — it seeds the table when empty, the same rule the FAQs use.
 
 ## Ordering Control
 

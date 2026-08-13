@@ -344,10 +344,30 @@ async def test_history_send_end_to_end():
         terms_mod._connect = real_connect
 
 
+def test_history_fast_path_phrasings():
+    """The fast path is the only authoritative answer here. Anything it misses
+    reaches the agent, which answered "Send term history" by stating no such
+    thing exists — and that claim was then summarised into conversation history
+    as fact, where it outlives the turn that produced it."""
+    # The shipped pattern, not a copy of it — a copy would pass while the real
+    # fast path stayed broken.
+    from bot.message_handler import _TERMS_HISTORY_PATTERN as pattern
+
+    for phrase in ("term history", "terms history", "my agreement", "my agreements",
+                   "Send term history", "agreement history", "what did i agree to"):
+        assert pattern.search(phrase.lower().strip()), f"fast path misses {phrase!r}"
+    # Must NOT swallow a plain consent word mid-terms-card, or the customer's
+    # "I agree" would open their agreement history instead of signing.
+    for phrase in ("i agree", "agree", "yes i agree to the terms"):
+        assert not pattern.search(phrase.lower().strip()), f"fast path over-matches {phrase!r}"
+    print("[ok] agreement-history fast path: singular/plural phrasings hit, 'I agree' does not")
+
+
 async def main():
     test_card_validates()
     test_history_card_validates()
     test_sqlite_roundtrip()
+    test_history_fast_path_phrasings()
     await test_history_send_end_to_end()
     await test_agree_places_order()
     await test_decline_cancels_order()

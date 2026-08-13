@@ -39,6 +39,19 @@ _sender_locks: dict[str, asyncio.Lock] = {}
 _running_tasks: set[asyncio.Task] = set()   # asyncio only holds weak refs to tasks
 
 
+# ── Agreement-history fast path (JNO-98) ─────────────────────────────────────
+# Word-bounded like the other fast paths so "I agree" during a terms card can't
+# trip it. `terms?`/`agreements?` are optional-plural because "term history"
+# (singular) missed this, fell through to the agent, and got answered with "no
+# such thing exists" — which the summariser then hardened into history as fact.
+# Module scope so tests bind to the shipped pattern rather than a copy of it.
+_TERMS_HISTORY_PATTERN = _re.compile(
+    r'\b(agreements? history|my agreements?|show my agreements?|terms? history|'
+    r'my terms|signed terms|what did i agree to|what have i agreed to)\b',
+    flags=_re.IGNORECASE,
+)
+
+
 async def _run_serialized(handler, room, event):
     lock = _sender_locks.setdefault(event.sender, asyncio.Lock())
     async with lock:
@@ -252,14 +265,8 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
             return
 
         # ── Fast-path: agreement history bypasses the agent entirely (JNO-98) ─
-        # Checked before the order-history path would ever be reached for these
-        # phrasings, and kept word-bounded like the others so "I agree" during a
-        # terms card can't trip it.
-        _TERMS_HISTORY_PATTERN = _re.compile(
-            r'\b(agreement history|my agreements|show my agreements|terms history|'
-            r'my terms|signed terms|what did i agree to|what have i agreed to)\b',
-            flags=_re.IGNORECASE,
-        )
+        # Pattern lives at module scope (above) so tests bind to the shipped
+        # regex rather than a copy of it.
         if _TERMS_HISTORY_PATTERN.search(message.lower().strip()):
             await matrix_client.room_typing(room_id, typing_state=False)
             from bot.terms.terms_service import send_terms_history_card
