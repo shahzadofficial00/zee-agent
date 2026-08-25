@@ -33,6 +33,8 @@ _room_send = matrix_client.room_send
 
 async def _room_send_trusting(*args, **kwargs):
     kwargs.setdefault("ignore_unverified_devices", True)
+    # JNO-292: no usage counting here — metering moved to the jaeno-metering
+    # homeserver appservice, which bills every operator, not just this one.
     return await _room_send(*args, **kwargs)
 
 

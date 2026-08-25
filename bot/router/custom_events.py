@@ -3,7 +3,8 @@ from nio import MatrixRoom, UnknownEvent
 from bot.matrix_client import matrix_client, BOT_START_TIME, send_text
 from bot.router.state import (
     processed_event_ids, conversation_histories, pending_orders,
-    poll_response_timers, logger, ensure_history_loaded, persist_history,
+    poll_response_timers, logger, HISTORY_WINDOW,
+    ensure_history_loaded, persist_history,
 )
 from bot.router.order_flow import _handle_order_flow_poll_answer, _handle_declined_confirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
@@ -112,7 +113,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
         persist_history(sender)
 
         messages = []
-        for msg in conversation_histories[sender][-20:]:
+        for msg in conversation_histories[sender][-HISTORY_WINDOW:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
 
         await matrix_client.room_typing(room_id, typing_state=True, timeout=8000)
@@ -207,7 +208,7 @@ async def handle_custom_event(room: MatrixRoom, event: UnknownEvent):
 
         async def _run_agent_for_poll_answer():
             messages = []
-            for msg in conversation_histories[sender][-20:]:
+            for msg in conversation_histories[sender][-HISTORY_WINDOW:]:
                 messages.append({"role": msg["role"], "content": msg["content"]})
             if sender in pending_orders:
                 messages.append({"role": "user", "content": f"[Reminder — order in progress: {pending_orders[sender]}]"})

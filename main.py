@@ -114,7 +114,13 @@ async def main():
    
 
     logger.info("✅ Listening for new messages...")
-    await matrix_client.sync_forever(timeout=3000, full_state=False)
+    try:
+        await matrix_client.sync_forever(timeout=3000, full_state=False)
+    finally:
+        await matrix_client.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Shutting down")

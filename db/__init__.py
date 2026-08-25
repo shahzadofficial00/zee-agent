@@ -32,6 +32,10 @@ from db.auctions import (
 from db.conversation_history import (
     init_conversation_history_schema, load_history, save_history,
 )
+from db.checkout_state import (
+    init_checkout_state_schema, load_checkout_state, save_checkout_state,
+    delete_checkout_state, CHECKOUT_TTL_MINUTES,
+)
 from db.terms import (
     init_agreements_schema, has_agreed, save_agreement, get_agreements,
 )
@@ -55,6 +59,7 @@ def init_db():
     init_polls_schema(cur)
     init_auctions_schema(cur)
     init_conversation_history_schema(cur)
+    init_checkout_state_schema(cur)
     init_agreements_schema(cur)
     init_faqs_schema(cur)
 

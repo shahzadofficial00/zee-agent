@@ -4,7 +4,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 
 - **Bot user:** `@dot_cafe:jaeno.ai`
 - **Matrix server:** `https://chat.jaeno.ai`
-- **LLM:** Gemini 2.5 Flash via OpenRouter, on LangChain/LangGraph (swap models with `OPENROUTER_MODEL`)
+- **LLM:** MiniMax M2.7 (free tier) via OpenRouter, on LangChain/LangGraph (swap models with `OPENROUTER_MODEL`)
 
 ## Features
 
@@ -111,7 +111,9 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 | Variable | Purpose |
 |---|---|
 | `OPENROUTER_API_KEY` | OpenRouter key — this is the LLM credential |
-| `OPENROUTER_MODEL` | Model slug (default `google/gemini-2.5-flash`) |
+| `OPENROUTER_MODEL` | Model slug — currently `minimax/minimax-m2.7:free`, falls back to `google/gemini-2.5-flash` if unset |
+| `OPENROUTER_MAX_TOKENS` | Reply cap (default `2048`) |
+| `AGENT_HISTORY_WINDOW` | Past messages injected per agent call (default `20`) |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_KEY` | Supabase service key |
 | `SUPABASE_ANON_KEY` | Supabase anon key (for REST calls) |
@@ -122,6 +124,8 @@ Each incoming event is handled in its own task, serialized per sender (`bot/mess
 | `ONLINE_PAYMENTS_ENABLED` | Master Swich kill switch — default `"false"` (cash-only) |
 | `TIPS_ENABLED` | Post-order tip card on/off — default `"false"` |
 | `LANGSMITH_API_KEY` | LangSmith tracing key (`LANGCHAIN_API_KEY` is the legacy alias) |
+
+> ⚠️ **`402 Prompt tokens limit exceeded` means you're out of OpenRouter credits, not out of context.** On a *paid* model OpenRouter derives a max-prompt-size cap from your remaining balance (`limit_source: openrouter_credits`), and **switching to another paid model won't help** — the cap follows the account. The system prompt plus tool schemas already cost ~8.5k tokens before the customer types anything, so there's little to trim. Either top up credits, or point `OPENROUTER_MODEL` at a `:free` model (they aren't billed against credits). Free models have daily request caps and upstream rate limits, so that's a stopgap for a live bot, not a destination.
 
 ## Database
 

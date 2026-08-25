@@ -43,7 +43,11 @@ llm = ChatOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
     temperature=0.4,
-    max_tokens=2048,  # OpenRouter reserves credits against this; unset = 65535 = 402 on a low balance
+    # OpenRouter reserves credits against this up front; unset = 65535 = 402 on a
+    # low balance. Free (":free") models aren't billed against credits, so 2048 is
+    # safe again -- drop it back to ~1024 if OPENROUTER_MODEL is ever pointed at a
+    # paid model on a near-empty balance.
+    max_tokens=int(os.getenv("OPENROUTER_MAX_TOKENS", "2048")),
     max_retries=6,
     timeout=25,
     rate_limiter=rate_limiter,

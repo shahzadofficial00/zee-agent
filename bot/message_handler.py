@@ -18,7 +18,8 @@ from db import get_pending_payment_by_user, update_payment_status
 from bot.router.state import (
     conversation_histories, processed_event_ids, last_orders, pending_orders,
     order_flows, awaiting_reorder_confirmation, awaiting_calculator_order,
-    _REORDER_AFFIRMATIONS, ensure_history_loaded, persist_history,
+    _REORDER_AFFIRMATIONS, HISTORY_WINDOW, ensure_history_loaded, persist_history,
+    ensure_checkout_loaded, persist_checkout,
 )
 from bot.router.order_flow import _start_order_flow, _start_fulfillment_stage, _handle_reorder_affirmation
 from bot.router.agent_invoke import _invoke_agent_with_retry
@@ -55,12 +56,24 @@ _TERMS_HISTORY_PATTERN = _re.compile(
 async def _run_serialized(handler, room, event):
     lock = _sender_locks.setdefault(event.sender, asyncio.Lock())
     async with lock:
+        # Checkout state is loaded/saved here rather than at each of the ~20
+        # mutation sites (gap #5). The lock makes this safe: no other task can be
+        # touching this sender's flow, so the snapshot taken on the way out is
+        # always whole. Save in `finally` — a handler that blew up mid-checkout
+        # still persists whatever stage it reached, which is the case where
+        # losing the flow hurts most.
+        is_customer = event.sender != matrix_client.user_id
+        if is_customer:
+            ensure_checkout_loaded(event.sender)
         try:
             await handler(room, event)
         except Exception as e:
             # Must not escape: an exception here used to propagate out of the nio
             # callback and kill sync_forever (the whole bot) for every user.
             logger.error(f"unhandled error handling {event.event_id}: {e}", exc_info=True)
+        finally:
+            if is_customer:
+                persist_checkout(event.sender)
 
 
 def _spawn(handler, room, event):
@@ -340,7 +353,7 @@ async def _handle_message(room: MatrixRoom, event: RoomMessageText):
             user_content = message
 
         messages = []
-        for msg in conversation_histories[sender][-20:]:
+        for msg in conversation_histories[sender][-HISTORY_WINDOW:]:
             messages.append({"role": msg["role"], "content": msg["content"]})
         if sender in pending_orders:
             messages.append({"role": "user", "content": f"[Reminder — order in progress: {pending_orders[sender]}]"})

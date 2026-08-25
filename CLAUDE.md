@@ -7,7 +7,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - **Bot user:** `@dot_cafe:jaeno.ai`
 - **Matrix server:** `https://chat.jaeno.ai`
 - **Room:** `!NyMqNOqWDDsZLJsVAA:jaeno.ai`
-- **LLM:** Gemini 2.5 Flash via OpenRouter (OpenAI-compatible client), LangChain/LangGraph
+- **LLM:** MiniMax M2.7 (free tier) via OpenRouter (OpenAI-compatible client), LangChain/LangGraph
 
 ---
 
@@ -24,7 +24,9 @@ Restaurant Agent/
 │   ├── test_terms.py           # JNO-90/97/98 — 9 checks
 │   ├── test_faq.py             # JNO-54/55/56 — 4 checks
 │   ├── test_calculator.py      # JNO-233/234-237 — 10 checks
-│   └── test_menu.py            # Local menu — 4 checks (seed, int price, fields, idempotence)
+│   ├── test_menu.py            # Local menu — 4 checks (seed, int price, fields, idempotence)
+│   ├── test_countdown.py       # JNO-84/85 — 3 checks (schema, optional omission, deadline rule)
+│   └── test_checkout_state.py  # Gap #5 — 4 checks (round-trip, cleanup, TTL, hook wired)
 │                               # ⚠️ test.py and test_status.py stay at the ROOT on purpose:
 │                               #   despite the names they are manual triggers, not tests —
 │                               #   they log into Matrix and fire real events at a live room
@@ -43,11 +45,12 @@ Restaurant Agent/
 │   ├── polls.py                 # Polls, poll answers, item ratings
 │   ├── auctions.py              # Auctions, bids, the locked-transaction bid logic
 │   ├── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
+│   ├── checkout_state.py        # load/save/delete_checkout_state + CHECKOUT_TTL_MINUTES (gap #5)
 │   ├── terms.py                 # Signed agreements (has_agreed/save_agreement/get_agreements)
 │   └── faqs.py                  # FAQ rows + the match ladder (get_faqs/get_faq) + seed drafts
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
-│   ├── llm.py                  # Gemini 2.5 Flash config + rate limiter
+│   ├── llm.py                  # OpenRouter model config + rate limiter
 │   ├── prompt.py                # System prompt for "Zee"
 │   ├── middleware.py           # Guardrails, summarization, retry, PII, call limits
 │   ├── memory_tools.py         # Customer name/phone persistence (get/save_customer_info tools)
@@ -211,6 +214,7 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `auctions` | Auction metadata (title, starting_price, min_bid, ends_at, room_id, closed flag) |
 | `auction_bids` | One row per (auction_id, user_id) — a rebid updates the row in place rather than inserting a new one |
 | `conversation_history` | One row per user_id — their chat history as a JSON blob, so it survives a restart |
+| `checkout_state` | One row per user_id — the whole in-flight checkout as a JSON blob (gap #5). Row exists only while a checkout is live; deleted once the order is placed or cancelled |
 | `agreements` | Signed T&C records — `UNIQUE(user_id, terms_id, version)`, so a re-synced event can't duplicate one act of consent |
 | `faqs` | Question/answer pairs (JNO-54). Seeded with drafts only when empty, so edits survive a restart. `ORDER BY id` is the accordion's order — no `sort_order`/`category` column |
 
@@ -299,9 +303,17 @@ Incoming DSL events from the client are routed by `dsl.type`:
 
 ### LLM
 - **Provider:** OpenRouter, reached with `ChatOpenAI` (`langchain_openai`) pointed at `https://openrouter.ai/api/v1`. OpenRouter speaks the OpenAI wire format, so it's the same client class with a different `base_url` — no OpenAI account involved. The previous direct `ChatGoogleGenerativeAI` config is kept commented at the top of `agent/llm.py` rather than deleted.
-- **Model:** `OPENROUTER_MODEL`, defaulting to `google/gemini-2.5-flash`. Swapping models is an `.env` edit plus a restart — but a model change is a behavior change, and this agent's tool-calling is what everything downstream depends on. Re-run the checks before trusting a swap.
+- **Model:** `OPENROUTER_MODEL`, currently `minimax/minimax-m2.7:free` (the code default if unset is still `google/gemini-2.5-flash`). Swapping models is an `.env` edit plus a restart — but a model change is a behavior change, and this agent's tool-calling is what everything downstream depends on. Re-run the checks before trusting a swap.
 - **Temperature:** 0.4
-- **`max_tokens=2048`** — load-bearing, not a guess. OpenRouter reserves credits against `max_tokens` up front; unset it defaults to the model's full 65535 window, and the reservation alone returns **402** on a low balance even when the actual reply is 200 tokens.
+- **`max_tokens=2048`** (`OPENROUTER_MAX_TOKENS`) — load-bearing, not a guess. OpenRouter reserves credits against `max_tokens` up front; unset it defaults to the model's full 65535 window, and the reservation alone returns **402** on a low balance even when the actual reply is 200 tokens. Free (`:free`) models aren't billed against credits, so nothing is reserved and 2048 is safe; **drop it to ~1024 if `OPENROUTER_MODEL` is ever pointed back at a paid model on a near-empty balance.**
+
+**The credit balance is a prompt-size ceiling, not just a spend limit (2026-08-25).** On a paid model OpenRouter derives a *max prompt tokens* cap from the remaining balance and returns `402 Prompt tokens limit exceeded: 10404 > 10058` with `limit_source: openrouter_credits`. This is not a `max_tokens` problem and **switching to a different paid model does not help** — the cap follows the account, not the model. The floor here is roughly fixed: ~6.7k tokens for `SYSTEM_PROMPT` (26,978 chars) plus ~1.5–2k of tool schemas for 17 tools, so ~8.5k is spent before the customer says anything, leaving almost no room for history. Trimming the injected history window bought only ~200 tokens (10404 → 10199) and did **not** clear the cap; only moving to a `:free` model did.
+
+Three levers, in the order they're actually worth pulling: **top up credits** (the real fix, reverts everything else), **use a `:free` model** (today's answer), **shrink the prompt** (a rewrite of a 27KB prompt with real behavior risk — not attempted).
+
+**Picking a free model is an empirical question, not a spec question.** Of OpenRouter's ~16 free tool-calling models, all are reasoning models, and availability churns. `z-ai/glm-5.2:free` was the best on paper and is persistently 429'd upstream ("temporarily rate-limited"), so it was ruled out by testing rather than reading. `minimax/minimax-m2.7:free` was verified end-to-end through `_invoke_agent_with_retry`: correct tool calls on menu / item / order-start, a 6,667-token prompt accepted, 3.5–8.5s per turn. `nvidia/nemotron-3.5-lightning:free` also passed and is faster (3.8s) if latency matters more than instruction-following. Note MiniMax **rejects** `reasoning: {enabled: false}` outright (`400 Reasoning is mandatory for this endpoint`) — reasoning stayed on, and completion stayed at ~34 tokens anyway, so it never threatened the `max_tokens` budget.
+
+**Free tier is a stopgap, not a destination** — free models carry daily request caps and upstream rate limits that a customer-facing bot will hit. Topping up and reverting `.env` is the exit.
 - **Rate limit:** 2.0 req/s, max bucket 10 (`agent/llm.py`). The limiter counts requests *it* issues, not the client's internal retries, and one customer message costs 2–3 requests (model → tool → model) — so this is ~40–50 messages/min, not 120. Under OpenRouter the real ceiling is your credit balance and the upstream provider's limits, not a per-project RPM quota.
 - **Reasoning:** the old `thinking_budget=0` was a `ChatGoogleGenerativeAI` argument and does **not** exist on `ChatOpenAI` — it's gone, not ported. If the routed model reasons by default, that's now unbounded; OpenRouter's `reasoning` field is the knob, passed via `extra_body`.
 
@@ -399,7 +411,7 @@ The tip card is gated separately even though the guard already blocks tip paymen
 
 **Cash orders stay `'pending'` in order history until staff marks them paid** — `python update_order_status.py ORD-XXXXXX paid`. A bespoke `"cash"` status was tried first and reverted: the Flutter history page filters strictly on `paid`/`completed`/`delivered` → `pending` → `cancelled`, so any other string falls through **every** tab and the order disappears from the UI entirely (the page opens on "Completed", so the customer just sees "No orders found"). `'pending'` is also simply true — the customer hasn't handed over money yet.
 
-**Cash-Only Cancellation** — with no `payment_intents` row to cancel, "cancel" falls through to `db.cancel_last_pending_order()`, which flips the newest *recent* pending SQLite order to `'cancelled'`. Two bounds, both load-bearing, both covered by `test_cash_cancel.py`:
+**Cash-Only Cancellation** — with no `payment_intents` row to cancel, "cancel" falls through to `db.cancel_last_pending_order()`, which flips the newest *recent* pending SQLite order to `'cancelled'`. Two bounds, both load-bearing, and **currently uncovered** — `test_cash_cancel.py` is referenced here but does not exist in `tests/`; it was either never written or lost. Both bounds below are the kind that fail silently and void a real order, so this is the most worthwhile test to add:
 
 - **`\bcancel\b`, not `'cancel' in message`** — this branch writes to the `orders` table now, not just a Supabase payment row, so the old substring test would have voided a real order on "what's your cancellation policy?" or "my last order was cancelled".
 - **`CANCEL_WINDOW_MINUTES = 15`** (`db/orders.py`) — nothing moves an order off `'pending'` except staff manually running `update_order_status.py ... paid`, so a delivered order whose cash was never marked collected is **indistinguishable in SQL** from one placed a minute ago. Unbounded, "cancel" days later would void a completed, paid-for sale. The window is the cheap stand-in for the lifecycle column that doesn't exist; if `preparing`/`delivered` ever persist durably, check those instead and drop the constant.
@@ -616,7 +628,9 @@ This is separate from the per-item star **rating polls** (`send_rating_poll` / `
 | Variable | Purpose |
 |---|---|
 | `OPENROUTER_API_KEY` | OpenRouter key — **the live LLM credential** |
-| `OPENROUTER_MODEL` | Model slug, e.g. `google/gemini-2.5-flash`. Defaults to that if unset |
+| `OPENROUTER_MODEL` | Model slug — currently `minimax/minimax-m2.7:free`. Falls back to `google/gemini-2.5-flash` if unset |
+| `OPENROUTER_MAX_TOKENS` | Reply cap, default `2048`. Lower it on a paid model with a low balance — the reservation alone can 402. See Agent → LLM |
+| `AGENT_HISTORY_WINDOW` | How many past messages get injected per agent call, default `20` (= `HISTORY_CAP`). Lower it to shrink the prompt on a paid model with a low balance |
 | `GOOGLE_API_KEY` | **Unused.** Only the commented-out direct-Gemini block in `agent/llm.py` reads it. Kept so switching back is an uncomment, not a re-key |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_KEY` | Supabase service key |
@@ -682,12 +696,20 @@ Startup sequence:
 ## Conversation History
 
 Per-user conversation history lives in the `conversation_histories` dict, write-through cached to the SQLite `conversation_history` table (`db/conversation_history.py`):
-- Last 20 messages injected into each agent call
+- Last `HISTORY_WINDOW` messages injected into each agent call — 20 by default, overridable with `AGENT_HISTORY_WINDOW`. Separate constant from `HISTORY_CAP` (what's *stored*) purely so the injected prompt can be shrunk without throwing history away: on a paid model OpenRouter caps prompt size by credit balance (see Agent → LLM). The three injection sites (`message_handler.py`, `custom_events.py` ×2) all read it — a fourth that hardcodes a slice would silently escape the lever
 - Capped at 20 messages per user — the cap lives in `persist_history()` (`bot/router/state.py`), **not** at each call site: the poll paths in `custom_events.py`/`order_flow.py` append without capping, and persistence would turn that into an unbounded row on disk
 - **Survives a bot restart.** `ensure_history_loaded(sender)` reloads from SQLite on first touch per sender; `persist_history(sender)` must be called after every mutation
 - Writes are synchronous SQLite on the asyncio loop — one small blob per message, fine at this scale, revisit if it ever shows up in latency
 
-The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`) is still **in-memory only**, living alongside the history dict in `bot/router/state.py`. A bot restart mid-checkout loses that state — a known gap, not yet fixed. Conversation history's `ensure_history_loaded`/`persist_history` pair is the working template for the planned fix (a write-through SQLite table for `order_flows` keyed by `user_id`), which is why history got done first.
+The deterministic order-flow state (`order_flows`, `pending_orders`, `last_orders`, `last_order_line`/`last_order_state`, `awaiting_reorder_confirmation`, `awaiting_calculator_order`) lives alongside the history dict in `bot/router/state.py` and is **also write-through cached now** (gap #5, fixed) — one `checkout_state` row per user holding all of it as one JSON blob, via `ensure_checkout_loaded`/`persist_checkout`, built on the `ensure_history_loaded`/`persist_history` template.
+
+**The hook is at `_run_serialized` (`bot/message_handler.py`), not at the mutation sites.** These dicts are written from ~20 places across `order_flow.py`, `dsl_text_events.py` and `message_handler.py`, and one missed call site is an order that silently doesn't survive a restart — so instead the whole per-user checkout is loaded once on the way into a turn and snapshotted once on the way out, capturing whatever the turn did by whichever path, including paths added later. The per-sender lock is what makes that safe: nothing else can be mid-mutation, so the snapshot is never torn. The save is in a `finally`, so a handler that raises mid-checkout still persists the stage it reached.
+
+**`CHECKOUT_TTL_MINUTES = 180`** (`db/checkout_state.py`) — a parked checkout older than this is not restored. Resuming a two-day-old "what size would you like?" after a restart is more confusing than starting fresh, and the `order_id` inside it was minted against a cancel window that lapsed long ago. Same class of bound as `CANCEL_WINDOW_MINUTES`, same reason: nothing else marks the flow abandoned.
+
+**A LangGraph checkpointer does not solve this and would break history.** None of these dicts are graph state — the graph only ever sees `{"messages": [...]}`, rebuilt fresh each turn in `agent_invoke.py`. Adding a checkpointer with a `thread_id` would make LangGraph *append* those re-injected messages to already-persisted thread state, doubling the history every turn. The re-injection and the checkpointer are two answers to the same question; this repo uses the first.
+
+Checks: `python -m tests.test_checkout_state` — 4 checks covering the round-trip, row cleanup after an order is placed, the TTL, and that the hook is actually wired into `_run_serialized`.
 
 ---
 
@@ -714,14 +736,14 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 2. **No admin/staff permission check** anywhere — `ordering_config.py` mitigates this for ordering toggles (hand-edited, restart-required, no chat exposure), but is worth keeping in mind for any future admin-style feature. `HumanInTheLoopMiddleware` would be the right LangChain primitive if this becomes a priority.
 3. **`orders` table (SQLite) vs. `stable_order_id`** — confirm whether `update_order_room_id` / `update_order_stable_id` fully reconcile these now, or if older rows predate the random-ID scheme and still carry the old DB-generated ID.
 4. **Schema/DSL version drift** — any new DSL type or field needs simultaneous updates to the sender, `schema.json` (Python-validated outbound path only), and the Dart handler. DSL sent from Edge Functions bypasses Python's `safe_send_dsl()` entirely — no schema enforcement on that path.
-5. **In-memory checkout state doesn't survive a restart** — `order_flows` and friends only; conversation history itself is now persisted (see Conversation History section above). Not yet fixed for checkout.
+5. ~~**In-memory checkout state doesn't survive a restart**~~ — **fixed.** `order_flows` and friends are write-through cached to the `checkout_state` table, hooked once at `_run_serialized` rather than at each mutation site (see Conversation History). What's left is narrower: state is only saved at *turn* boundaries, so a crash *during* a turn loses that turn's progress (the `finally` covers a raised exception, not a killed process), and the legacy native-poll debounce path in `custom_events.py` mutates `last_orders` outside the lock, so those writes aren't captured.
 6. **No dedicated `tips` table** — tip payments live in `payment_intents` distinguished only by the `TIP-` prefix; fine for the payment mechanics, not great for tip-specific reporting.
 7. **`poll_results` DSL's `results` breakdown array is only ever populated for rating polls** — the Flutter side already renders a generic percentage-bar breakdown for any poll type, but no Python service computes/sends that data for size/flavor/confirmation polls yet.
 8. **No auction creation trigger** — `create_and_send_auction()` has to be called manually (see Auctions section); there's no chat command, Supabase-polling, or staff UI wired up yet. Deliberate scope cut, not an oversight.
 9. **No permission check on who can create an auction or place a bid** — same class of gap as #2, just unmitigated here (ordering_config's "hand-edited, restart-required" approach doesn't apply to auctions since creation is a runtime function call). Anyone who can call `create_and_send_auction()` or send a `bid_confirmation` DSL event can act.
 10. **Auction `payment_intents` reuse the winner's Matrix `user_id`/saved customer info** — same "no `tips` table"-style tradeoff as #6: fine for payment mechanics, no dedicated auction-analytics table if that's ever needed.
 11. **No order_status trigger UI** — `update_order_status.py` is a manually-run CLI script (same deliberate scope cut as auction creation, gap #8); a real staff dashboard is the natural next step if this goes into an actual restaurant, calling the same `send_order_status_update()` function underneath.
-12. **In-memory checkout state doesn't distinguish "mid-fulfillment" from any other in-progress stage** — a restart during `fulfillment_method`/`awaiting_name`/`awaiting_car`/`awaiting_address` loses that state exactly like every other `order_flows` stage (see gap #5); not a new gap, just confirming the fulfillment stages inherit the existing one.
+12. ~~**In-memory checkout state doesn't distinguish "mid-fulfillment" from any other in-progress stage**~~ — **fixed with gap #5.** The fulfillment stages were never special; they persist and restore with every other `order_flows` stage now, since the whole dict is snapshotted rather than named fields.
 13. **Marking cash collected is a manual CLI step, and nothing reconciles it** — `update_order_status.py ORD-XXXXXX paid` is the only way an order leaves `'pending'` now that no gateway callback fires. Forget to run it and the order sits in the customer's "Pending" tab forever with no Reorder button. There's no till integration, no daily reconciliation, and no permission check on who can run it (gap #2).
 14. **JNO-238 (Cash as a *selectable* payment method) deliberately not built** — while `ONLINE_PAYMENTS_ENABLED=false` cash is the only option, so a picker with one choice is UI for a decision that can't be made. Build it when online payment returns and there are genuinely two options.
 15. **The Flutter history page silently swallows unknown statuses** — `_filtered` matches `paid`/`completed`/`delivered`, then `pending`, then `cancelled`, with no catch-all tab. Any status outside that set makes the order vanish from every filter rather than showing under a fallback. This already bit the `"cash"` attempt (see Cash-Only Mode); anything new written to `orders.status` must map onto one of those three buckets or the UI needs a fourth.
@@ -732,7 +754,7 @@ The deterministic order-flow state (`order_flows`, `pending_orders`, `last_order
 20. **The in-repo schema is now a second copy, not the source of truth** — `dsl-spec/` was an unversioned Desktop folder shared by hand with the Flutter app; copying it in fixed the "not in git" problem but made the drift in gap #4 concrete. Nothing checks the two copies against each other.
 21. **Nothing guards against a `chain_id` collision** — since the client dropped its "previous question already answered" check, two senders picking the same value silently merge into one card, with no warning on either side. Only convention (the `rate_` prefix on rating polls) keeps them out of the checkout chain. See DSL Protocol → Poll chaining.
 22. **No terms-authoring surface** — the terms text is a hand-edited constant with a hand-bumped `TERMS_VERSION` (same "no admin UI yet" class as gaps #8/#11). The version suffixes in git history (`2026-08-05b/c/d`) are test artefacts from re-testing against the client's `terms_id@version` cache, not real revisions.
-23. **`awaiting_terms` is in-memory like every other checkout stage** — a restart while the customer has the terms card open loses the parked order (gap #5 again, not a new one). The agreement itself is safe: it's written to SQLite before the order is resumed, and the handler records consent even when there's no flow to resume.
+23. ~~**`awaiting_terms` is in-memory like every other checkout stage**~~ — **fixed with gap #5.** A restart while the terms card is open now restores the parked order at `awaiting_terms` and the inbound `terms_response` resumes it. The agreement was always safe regardless: written to SQLite before the order resumes, and recorded even when there's no flow to resume.
 24. **FAQ matching is substring-only, so re-worded questions miss** — `"what payment methods do you take"` never reaches *"How can I pay?"* mechanically. The LLM layer catches some of these by rephrasing; the rest fall through to normal chat. Deliberate (see FAQ section — the fuzzy tier only ever produced wrong answers), but it means coverage is exactly what you seed.
 25. **The bot will still state facts it doesn't have** — the FAQ fast path is only authoritative for seeded questions. Everything else relies on a prompt rule, and a prompt is not a constraint. It invented "plenty of parking right outside the cafe" once. Prompt hardening reduced it (wifi/seating/catering now defer correctly), but the only deterministic fix is seeding the question. Hours and location ARE legitimately known — they're in `CAFE KNOWLEDGE` in `agent/prompt.py`.
 26. **The calculator's item set is only as good as the category the model picks.** *(Narrowed 2026-08-13: `item_name` is gone, so the model can no longer collapse a general request to one silently-priced item — see Calculator. What's left is the category choice itself, and note `CALC_NO_CATEGORY|` only catches names that don't **exist** — a valid-but-wrong category, "coffee" → `["Cold Drinks"]`, still produces a perfectly good card answering the wrong question. It is at least visible: every option is a real item at its real price, so the customer can see the list is wrong and say so. Closing it entirely needs intent→category mapping — a keyword column on `menu_items` is the obvious shape — which is the same class of problem as FAQ matching (gap #24). Not built: the failure is now cosmetic and self-correcting, and tagging would move the judgement rather than delete it.)* Prices and option lists are resolved server-side from `menu_items`, so neither can be wrong. What remains model-judgement is *which* categories a request maps to — "coffee for 40" → `["Hot Classics", "Premium Brews", "Specialty Lattes"]` is a semantic call. Far smaller surface than the original gap (one category name vs. 17 hand-written options with hand-written prices), and bounded — every option shown is a real item at its real price whatever it picks.

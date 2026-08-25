@@ -93,7 +93,6 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
             reply = content
     else:
         reply = str(result)
-    print(f"📋 ALL MESSAGES: {[str(m.content) for m in result['messages']]}")
 
     # ── Flags for every signal string a tool can emit this turn ──────────────
     triggered_menu = False
@@ -114,7 +113,6 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
 
 
     all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
-    print(f"🔍 ALL CONTENT STRINGS: {all_content}")
 
     # ── Model call failed (retries exhausted) — show an outage banner instead of the raw error ──
     if any("Model call failed" in c for c in all_content):
