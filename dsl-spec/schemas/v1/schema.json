@@ -13,7 +13,7 @@
     },
     "type": {
       "type": "string",
-      "enum": ["menu", "payment", "appointment", "order_history", "menu_item", "menu_category", "order_confirmation", "banner", "poll", "poll_response", "poll_history", "poll_results", "tip_request", "auction", "auction_result", "fulfillment_method", "fulfillment_selection", "name_request", "name_response", "car_request", "car_response", "address_request", "address_response", "order_status", "terms", "terms_response", "terms_history", "faq", "countdown", "calculator", "calculator_result"],
+      "enum": ["menu", "payment", "appointment", "order_history", "menu_item", "menu_category", "order_confirmation", "banner", "poll", "poll_response", "poll_history", "poll_results", "tip_request", "auction", "auction_result", "fulfillment_method", "fulfillment_selection", "name_request", "name_response", "car_request", "car_response", "address_request", "address_response", "order_status", "terms", "terms_response", "terms_history", "faq", "countdown", "calculator", "calculator_result", "event", "event_detail", "ticket_confirmation", "ticket_request"],
       "description": "DSL event type"
     },
     "data": {
@@ -220,6 +220,30 @@
       "then": {
         "properties": {
           "data": { "$ref": "#/$defs/calculator_data" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "event" } } },
+      "then": {
+        "properties": {
+          "data": { "$ref": "#/$defs/event_data" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "event_detail" } } },
+      "then": {
+        "properties": {
+          "data": { "$ref": "#/$defs/event_detail_data" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ticket_confirmation" } } },
+      "then": {
+        "properties": {
+          "data": { "$ref": "#/$defs/ticket_confirmation_data" }
         }
       }
     }
@@ -660,6 +684,75 @@
             }
           }
         }
+      }
+    },
+
+    "event_fields": {
+      "type": "object",
+      "required": ["id", "title", "starts_at", "ends_at", "location_type"],
+      "properties": {
+        "id":            { "type": "string" },
+        "title":         { "type": "string" },
+        "starts_at":     { "type": "string" },
+        "ends_at":       { "type": "string" },
+        "location_type": { "type": "string", "enum": ["in_person", "online"] },
+        "location":      { "type": "string" },
+        "online_url":    { "type": "string" }
+      }
+    },
+
+    "event_data": {
+      "type": "object",
+      "required": ["title", "events"],
+      "properties": {
+        "title": { "type": "string" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/event_fields" }
+        }
+      }
+    },
+
+    "event_detail_data": {
+      "allOf": [
+        { "$ref": "#/$defs/event_fields" },
+        {
+          "type": "object",
+          "required": ["tiers"],
+          "properties": {
+            "description": { "type": "string" },
+            "tiers": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["name", "price"],
+                "properties": {
+                  "name":      { "type": "string" },
+                  "price":     { "type": "string" },
+                  "remaining": { "type": "integer" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+
+    "ticket_confirmation_data": {
+      "type": "object",
+      "required": ["event_id", "event_title", "reference", "tier_name", "quantity", "starts_at"],
+      "properties": {
+        "event_id":      { "type": "string" },
+        "event_title":   { "type": "string" },
+        "reference":     { "type": "string" },
+        "tier_name":     { "type": "string" },
+        "quantity":      { "type": "integer", "minimum": 1 },
+        "starts_at":     { "type": "string" },
+        "ends_at":       { "type": "string" },
+        "location_type": { "type": "string", "enum": ["in_person", "online"] },
+        "location":      { "type": "string" }
       }
     }
 

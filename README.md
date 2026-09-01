@@ -17,6 +17,7 @@ A Matrix chat bot named **Zee** for **Dot Cafe** (specialty coffee shop, DHA Pha
 - Terms & conditions — customers agree once before their first order (tap / typed name / drawn signature, whichever the device supports), with the signed text, version, method and timestamp kept as a record; "my agreements" shows the history and lets them read or download a copy of exactly what they agreed to
 - Countdown card — after ordering, a live timer showing the 15 minutes they have to cancel free of charge. The clock was always enforced; now the customer can see it
 - FAQ cards — a customer asking a common question gets a card with the saved answer, or the whole list as a tap-to-expand accordion if they say "faq". Answers come from a SQLite table you edit directly, never from the model
+- Events & ticketing — Zee can list what's on and show one event with its ticket tiers; tapping a tier books it. Whether a ticket exists is decided by a single locked database transaction, never by the count shown on the card, so two people tapping the last seat can't both get it
 - Table reservations
 - Poll ecosystem: single-choice (size, Yes/No), multi-select flavor preference, drag-to-rank, free-text special instructions, post-order star ratings, and poll history/results cards — related questions share a `chain_id` so a multi-item order asks for its sizes, instructions and ratings in **one** card that advances in place, not a stack of them
 - Post-order review prompts on a delay
@@ -38,7 +39,7 @@ Restaurant Agent/
 ├── db/                         # Database layer (SQLite + Supabase), one file per domain
 │   ├── connection.py           # Shared _connect() / _get_supabase() / fuzzy_match_key()
 │   ├── orders.py / customers.py / menu.py / payments.py
-│   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py / faqs.py
+│   └── reviews.py / polls.py / auctions.py / conversation_history.py / terms.py / faqs.py / events.py
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # OpenRouter (OpenAI-compatible) client + rate limiter
@@ -70,6 +71,7 @@ Restaurant Agent/
     ├── reviews/review_scheduler.py        # Async scheduler for post-order reviews
     ├── terms/terms_service.py             # Terms card + agreement history + the terms text itself
     ├── faq/faq_service.py                 # FAQ card — one entry expanded, several as an accordion
+    ├── events/event_service.py            # Event listing / detail / ticket confirmation cards
     ├── countdown/countdown_service.py     # Live countdown card (used for the cancel window)
     ├── auction/auction_service.py         # Auction + auction-result DSL cards, auction creation helper
     └── auction/auction_scheduler.py       # Async scheduler that closes due auctions and pays out the winner
@@ -212,6 +214,34 @@ Matching is deterministic, not AI: an exact or substring hit on a stored questio
 > ⚠️ **Never put a bare "cancel" in a question.** `cancel` is an order-cancellation command; mid-checkout such a question would void the customer's order instead of answering it. Use "cancellation" (as the seeded row does).
 
 Seeding an FAQ is also the only way to make a specific answer **impossible** to get wrong — outside the table the model can still state things it doesn't actually know.
+
+## Events & Tickets
+
+Events, their ticket tiers and prices are rows in SQLite — there's no admin UI yet. Two are seeded on first run, **only into an empty table**, so your edits survive restarts:
+
+```sql
+INSERT INTO events (title, description, starts_at, ends_at, location_type, location, online_url)
+VALUES ('Cupping Session', '...', '2026-10-05T17:00:00+00:00', '2026-10-05T19:00:00+00:00',
+        'in_person', 'Dot Cafe, DHA Phase 4, Lahore', '');
+
+INSERT INTO event_tiers (event_id, name, price, remaining) VALUES (3, 'Standard', 800, 20);
+```
+
+No restart needed. Customers ask ("what's on?", "tickets for the brewing masterclass?") and Zee sends the card; tapping a tier books it.
+
+Push cards into the room yourself, without the LLM:
+
+```bash
+python send_events.py                            # the events list card
+python send_events.py "Latte Art"                # one event + its ticket tiers
+python send_events.py "Latte Art" Spectator 2    # a real reservation + confirmation card
+```
+
+**The `remaining` count on the card is a snapshot, not the truth.** Every booking is re-decided server-side by `db.reserve_tickets_if_available()` inside one locked transaction — the same treatment auction bids get, for the same reason. Two customers tapping the last seat produce one ticket and one "sold out", whatever their screens said. The agent is never asked; it can't book a ticket, and its tools are told never to promise a seat or call something sold out.
+
+Reservations are recorded with a `TKT-XXXXXX` reference in the `tickets` table.
+
+> ⚠️ **Tickets are free right now** — no payment is taken for one, in line with cash-only mode. There's also no cancel, refund or check-in path: a reservation is permanent and its seat never returns to the pool. Both are noted in CLAUDE.md → Known Fragility / Gaps.
 
 ## Documentation
 

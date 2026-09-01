@@ -26,7 +26,9 @@ Restaurant Agent/
 │   ├── test_calculator.py      # JNO-233/234-237 — 10 checks
 │   ├── test_menu.py            # Local menu — 4 checks (seed, int price, fields, idempotence)
 │   ├── test_countdown.py       # JNO-84/85 — 3 checks (schema, optional omission, deadline rule)
-│   └── test_checkout_state.py  # Gap #5 — 4 checks (round-trip, cleanup, TTL, hook wired)
+│   ├── test_checkout_state.py  # Gap #5 — 4 checks (round-trip, cleanup, TTL, hook wired)
+│   └── test_events.py       # JNO-325 — 6 checks (last-seat race, reserve guards, 3 schemas,
+│                             #   inbound ticket_request, the no-match denial, tools write nothing)
 │                               # ⚠️ test.py and test_status.py stay at the ROOT on purpose:
 │                               #   despite the names they are manual triggers, not tests —
 │                               #   they log into Matrix and fire real events at a live room
@@ -47,7 +49,9 @@ Restaurant Agent/
 │   ├── conversation_history.py  # load_history/save_history — per-user chat history as a JSON blob
 │   ├── checkout_state.py        # load/save/delete_checkout_state + CHECKOUT_TTL_MINUTES (gap #5)
 │   ├── terms.py                 # Signed agreements (has_agreed/save_agreement/get_agreements)
-│   └── faqs.py                  # FAQ rows + the match ladder (get_faqs/get_faq) + seed drafts
+│   ├── faqs.py                  # FAQ rows + the match ladder (get_faqs/get_faq) + seed drafts
+│   └── events.py                # Events, ticket tiers, tickets + _SEED_EVENTS/_SEED_TIERS +
+│                                #   reserve_tickets_if_available() — the locked transaction
 ├── agent/
 │   ├── agent.py                # LangGraph agent assembly
 │   ├── llm.py                  # OpenRouter model config + rate limiter
@@ -66,6 +70,8 @@ Restaurant Agent/
 │       │                        # send_special_instructions_poll.py, show_poll_history.py
 │       ├── faq/                 # show_faq.py, show_faqs.py
 │       ├── calculator/          # send_calculator.py
+│       ├── events/              # show_events.py, show_event.py — signal strings only; they
+│       │                        #   never decide availability and never write a ticket
 │       └── show_banner.py       # Single tool, stays at root (no domain group needed)
 └── bot/
     ├── matrix_client.py        # AsyncClient wrapper + send_text helper
@@ -108,6 +114,8 @@ Restaurant Agent/
     │                            # needs_terms() — the per-order consent gate
     ├── faq/
     │   └── faq_service.py       # send_faq_card() — one card type for both FAQ stories
+    ├── events/
+    │   └── event_service.py     # event / event_detail / ticket_confirmation senders (JNO-325)
     ├── countdown/
     │   └── countdown_service.py # send_countdown_card() — no table, no inbound event
     ├── calculator/
@@ -186,6 +194,8 @@ message_handler.py
                     ├── RATING_POLL_TRIGGERED|... → send_rating_poll_to_room() (one event per
                     │                               item, one shared chain_id → ONE card)
                     ├── POLL_HISTORY_TRIGGERED    → send_poll_history_card()
+                    ├── EVENTS_TRIGGERED          → send_events_card()
+                    ├── EVENT_TRIGGERED|title     → send_event_detail_card()
                     ├── FAQ_TRIGGERED|name        → send_faq_card([one])
                     ├── FAQ_LIST_TRIGGERED        → send_faq_card(all)
                     └── CALC_TRIGGERED|{json}     → send_calculator_card()
@@ -216,6 +226,9 @@ The `db/` package re-exports every function through `db/__init__.py`, so every c
 | `conversation_history` | One row per user_id — their chat history as a JSON blob, so it survives a restart |
 | `checkout_state` | One row per user_id — the whole in-flight checkout as a JSON blob (gap #5). Row exists only while a checkout is live; deleted once the order is placed or cancelled |
 | `agreements` | Signed T&C records — `UNIQUE(user_id, terms_id, version)`, so a re-synced event can't duplicate one act of consent |
+| `events` | Events (title, description, starts_at, ends_at, location_type, location, online_url). Seeded from `_SEED_EVENTS` only when empty — same rule as `menu_items`/`faqs`, and the only git-tracked copy |
+| `event_tiers` | Ticket tiers per event — `UNIQUE(event_id, name)`. `remaining` here is the real count; the one on the card is a snapshot |
+| `tickets` | One row per reservation — `TKT-XXXXXX` reference, event, tier, quantity, user_id |
 | `faqs` | Question/answer pairs (JNO-54). Seeded with drafts only when empty, so edits survive a restart. `ORDER BY id` is the accordion's order — no `sort_order`/`category` column |
 
 **Supabase** — remote, async:
@@ -265,6 +278,10 @@ All rich UI cards are sent as Matrix `m.room.message` events with an `ai.jaeno.d
 | `calculator` | v1 | Agent-configured calculator (JNO-233/237). `title`/`fields`/`formula`/`result_label` required; `subtitle`/`result_unit` omitted when empty. `fields` is 1–8 entries of `{key, label, type: number\|choice, min?, max?, required?, options?}`; a `choice` option's `value` is the **number** the formula sees, its `label` is what the customer reads. **Python never evaluates the formula** — the client does, live |
 | `calculator_result` | v1 | Inbound-only: the customer's filled-in estimate (JNO-236). Carries display **labels and values**, not field keys, because nothing server-side remembers the card that was sent |
 | `faq` | v1 | Q&A card (JNO-54). **One type covers both stories** — the client renders a single `items` entry expanded (the direct answer, JNO-55) and several as a collapsed accordion (JNO-56), so Python never picks a layout. `question`/`answer` must be **strings** — the Dart reads them as `String?` off a plain map, so a non-string throws in the cast (same class as the menu `price` bug). Answers are plain text; the widget library renders no markdown |
+| `event` | v1 | Event listing (JNO-334) — `{title, events: [{id, title, starts_at, ends_at, location_type, location, online_url}]}`. `id` is a **string**, same reason menu `price` is |
+| `event_detail` | v1 | One event plus `description` and `tiers: [{name, price, remaining?}]` (JNO-334). `price` is a pre-formatted **string** (menu convention). `remaining` is optional on purpose — a caller with no trustworthy count omits it rather than shipping a lie |
+| `ticket_request` | v1 | Inbound-only: `{event_id, tier_name, quantity}` (JNO-335). Whatever the card said about availability is irrelevant — see Events & Tickets |
+| `ticket_confirmation` | v1 | Sent only *after* the reservation committed (JNO-336) — event, tier, quantity, and the `TKT-XXXXXX` reference |
 | `terms_history` | v1 | Agreement history (JNO-98) — trigger card in the timeline, full list on tap. Declines included. `agreed` must be a real JSON bool, not SQLite's 0/1 |
 | `order_status` | v1 | Staff-pushed order lifecycle card — `preparing`/`ready`/`on_the_way`/`delivered` get a dedicated icon+label client-side, any other string falls back to a generic icon + title-cased label |
 
@@ -276,6 +293,7 @@ Incoming DSL events from the client are routed by `dsl.type`:
 - `bid_confirmation` — customer placed/updated a bid on a live auction → re-validated server-side against the current highest bid (the Flutter client's own min-bid check is cosmetic only) via `db.place_bid_if_higher()`, then upserted into `auction_bids` (no LLM)
 - `fulfillment_selection` / `name_response` / `car_response` / `address_response` — the fulfillment flow's inbound half, see Order Fulfillment section below (no LLM)
 - `terms_response` — customer agreed to / declined the order terms → records the agreement, then resumes or cancels the parked order (no LLM). See Terms & Conditions below
+- `ticket_request` — customer picked a tier and quantity on an event card → re-decided server-side by `db.reserve_tickets_if_available()` inside one locked transaction, then a `ticket_confirmation` card or a sold-out message (no LLM). See Events & Tickets below
 - `calculator_result` — customer sent their estimate into the chat (JNO-236) → summarises it, offers the order, and a "yes" runs the deterministic order flow (no LLM). See Calculator below
 - `payment_success` — **dead code**, kept for reference only (see Payment section)
 
@@ -338,6 +356,8 @@ Three levers, in the order they're actually worth pulling: **top up credits** (t
 | `show_banner(variant, title, message, meta)` | Visual callout (outage, warning, success, info) | `"BANNER_TRIGGERED\|..."` |
 | `show_faq(question)` | A general question the fast path couldn't match — the LLM rephrases it toward a stored question | `"FAQ_TRIGGERED\|{matched question}"` or `"FAQ_NO_MATCH"` |
 | `show_faqs()` | Customer wants to browse every FAQ | `"FAQ_LIST_TRIGGERED"` |
+| `show_events()` | Customer asks what's on | `"EVENTS_TRIGGERED"`, or `"EVENTS_NONE"` when the calendar is empty |
+| `show_event(event_name)` | Customer names an event, or asks about its tickets/prices | `"EVENT_TRIGGERED\|{matched title}"` or `"EVENT_NO_MATCH"` |
 | `send_calculator(title, quantity_label, categories, ...)` | An estimate depending on a quantity only the customer has (catering/bulk). **Builds the fields, options, prices and formula itself** from the live menu — the model only names categories | `"CALC_TRIGGERED\|{json}"`, or `CALC_NO_CATEGORY\|{valid names}` / `CALC_MENU_UNAVAILABLE` |
 | `get_menu_prices()` | Before `send_calculator` — this is where the exact category spellings come from | `"Hot Classics: Espresso 10, Latte 30\|nCold Drinks: ..."` or `"MENU_PRICES_UNAVAILABLE"` |
 
@@ -558,6 +578,60 @@ Checks: `python -m tests.test_calculator` — 10 checks: the formula gate (13 un
 
 ---
 
+## Events & Tickets (JNO-325)
+
+Four DSL types — `event`, `event_detail`, `ticket_request`, `ticket_confirmation`
+— built to the same split the epic describes: Jaeno owns the payload contract
+and the Flutter rendering ("the pipe, not the agent"), and **capacity,
+availability and what a reservation means live here**. Jaeno has no table and
+no opinion about either.
+
+**The count on the card is decoration; `reserve_tickets_if_available()` is the
+sale.** One `BEGIN IMMEDIATE` transaction reads `remaining`, decrements it and
+writes the `tickets` row, so two customers tapping the last seat in the same
+instant are both resolved under the write lock and exactly one gets it. This is
+`place_bid_if_higher()` again, for the same reason and in the same shape — the
+app's min-bid check is cosmetic, and so is its sold-out state. Read-then-write
+outside the transaction sells the seat twice, which is what `tests/test_events.py`
+drives two real threads at a `Barrier` to catch.
+
+**`ticket_request` never reaches the LLM.** `bot/router/dsl_text_events.py`
+takes it straight to the transaction — card on a reference, plain text on a
+refusal — exactly like `bid_confirmation`. Inbound DSL is unvalidated, so the
+quantity is coerced and a non-positive one refused there and again in the
+transaction.
+
+**The tools cannot book.** `show_events`/`show_event` return signal strings,
+take no quantity, and never touch `tickets`; their docstrings forbid promising
+a seat or declaring anything sold out. `tests/test_events.py` asserts both the
+absence of a quantity argument and an empty `tickets` table after calling them.
+Everything the model can get wrong is therefore cosmetic — the tiers, prices
+and counts on the card are all read from `event_tiers` server-side.
+
+**A miss has to say "no" out loud.** `show_event` returning `EVENT_NO_MATCH`
+makes the model fall back to the list, and MiniMax frequently writes no prose at
+all — so "do you have a sourdough workshop?" was answered with a card of two
+unrelated events and no denial. The denial is now emitted by
+`agent_dispatch.py` itself when `EVENT_NO_MATCH` is seen, not left to the model.
+Same class as gap #25, wearing a card.
+
+**No admin surface** (gap #8's family): events and tiers are rows. `_SEED_EVENTS`
+seeds only an empty table and is the only tracked copy; a live change is an
+`UPDATE`/`INSERT` on `event_tiers`, no restart. `send_events.py` is the manual
+trigger for pushing cards without the LLM, same pattern as `test.py` and
+`update_order_status.py`.
+
+Tickets are **free** — no `payment_intents` row, consistent with cash-only mode.
+The epic also assumes a `reminder` DSL type for event reminders; this repo has
+none, so that half isn't built.
+
+Checks: `python -m tests.test_events` — 6 checks: the last-seat race (two real
+threads), the reserve guards, all three card schemas (incl. a numeric `price`
+being rejected), the inbound handler's three branches, the no-match denial, and
+that the tools write nothing.
+
+---
+
 ## FAQ (JNO-54)
 
 Two stories, **one** DSL type: JNO-55 (one relevant answer) and JNO-56 (browse them all) differ only in how many `items` the card carries, and the client picks the layout. The agent sends what it selected.
@@ -587,6 +661,16 @@ Fixed at the source: **no dispatch branch returns a bracketed pseudo-reply any m
 Any new card-only branch must follow the same rule: whatever goes in `clean_reply` should be a sentence that is **harmless if the model repeats it verbatim**.
 
 **Fourth and fifth instances — poll history and banner, caught in production 2026-08-13.** Both still assigned `clean_reply = ""`, which is failure mode (2), not a fix for it. Live, `"Send poll history"` was answered `"Got it!"`; the summariser then compressed that turn into *"'poll history' and 'term history' … are not supported functionalities"* — and since summaries are re-injected on every later turn, the bot went on asserting a real, registered tool didn't exist. That is gap #27 with a false **capability** claim rather than a false fact, and it outlives the turn that caused it. Both branches now keep the model's own sentence with a plain fallback (`"Here's your poll history."`, the banner's own `message`). `tests/test_calculator.py` now asserts at **source level** that no branch in `agent_dispatch.py` assigns an empty `clean_reply`, which covers branches no test drives — the two above were exactly that.
+
+**Sixth instance, a new shape — a marker the model *invented*.** Asked about an
+event, MiniMax replied with the literal `EVENTS_CARD`. No tool emits that
+string; the model coined it by analogy with `MENU_CARD`/`ITEM_CARD`, which it
+sees in the prompt — and the events branch would have sent it to the customer as
+its lead-in text and written it to history. `agent_dispatch.py` already carried a
+`.replace("ITEM_CARD", "")` added after exactly this happened once before, which
+is a fix that only covers the name you've already been burned by.
+`_is_signal_noise()` now blanks any reply that is a bare all-caps-with-underscore
+token, for **every** branch, so the next coinage costs nothing.
 
 **Third instance — the calculator, JNO-237.** The branch stored the card *title* (`clean_reply = "Catering Estimate"`), copying the poll precedent. It doesn't transfer: a poll stores its **question**, which is a sentence; a title is a label. Within three turns the model was answering catering questions with the literal words "Catering Estimate" and had stopped calling `send_calculator` — failure mode (1) and (3) at once. The branch now keeps the model's own lead-in sentence, falling back to a fixed sentence when it wrote none. **`""` is not an escape hatch**: `message_handler.py` substitutes `"Got it!"` for an empty `clean_reply`, which is failure mode (2). `tests/test_calculator.py` asserts the value is non-empty, isn't the title, and contains a space.
 
@@ -726,7 +810,7 @@ Checks: `python -m tests.test_checkout_state` — 4 checks covering the round-tr
 - **Fulfillment and terms before final confirm, not after** — the fulfillment method/detail cards fire right after customer info is settled, the terms card (if needed) right after those, and the "Shall I proceed?" poll is deliberately the *last* step, once fulfillment details and consent are both already settled. The receipt reflects everything at once, and the customer never confirms an order before fulfillment or the agreement has entered the picture.
 - **Feature flags over code removal for the cash-only transition** — `ONLINE_PAYMENTS_ENABLED`/`TIPS_ENABLED` gate behavior; the Swich integration, tip handlers, and v1/v2 receipt senders all stay in the tree, untouched. Re-enabling is an `.env` edit plus a restart, not a revert. Both default to `false` on purpose: this gates real money movement, so a missing env var must fail closed.
 - **Terms gate is automatic and version-keyed, not a CLI** — unlike auctions and order status, consent isn't staff-triggered: it fires from the order flow itself, and `has_agreed(user_id, terms_id, version)` means a repeat customer signs once rather than per order. Sending it on first contact was rejected — most customers never place an order, so it would store thousands of signatures for interactions that never happened, and open every conversation with a legal document. The terms text also deliberately never passes through the LLM: a paraphrased contract is a fabricated one.
-- **Manual CLI triggers over premature admin UI** — both `create_and_send_auction()` and `send_order_status_update()` are called directly (via `test.py`/`update_order_status.py`), not exposed to the LLM or gated behind a permission system that doesn't exist yet. A real staff surface can call the same functions later without touching the underlying logic.
+- **Manual CLI triggers over premature admin UI** — `create_and_send_auction()`, `send_order_status_update()` and the event/ticket senders are called directly (via `test.py`/`update_order_status.py`/`send_events.py`), not exposed to the LLM or gated behind a permission system that doesn't exist yet. A real staff surface can call the same functions later without touching the underlying logic.
 
 ---
 
@@ -758,4 +842,7 @@ Checks: `python -m tests.test_checkout_state` — 4 checks covering the round-tr
 24. **FAQ matching is substring-only, so re-worded questions miss** — `"what payment methods do you take"` never reaches *"How can I pay?"* mechanically. The LLM layer catches some of these by rephrasing; the rest fall through to normal chat. Deliberate (see FAQ section — the fuzzy tier only ever produced wrong answers), but it means coverage is exactly what you seed.
 25. **The bot will still state facts it doesn't have** — the FAQ fast path is only authoritative for seeded questions. Everything else relies on a prompt rule, and a prompt is not a constraint. It invented "plenty of parking right outside the cafe" once. Prompt hardening reduced it (wifi/seating/catering now defer correctly), but the only deterministic fix is seeding the question. Hours and location ARE legitimately known — they're in `CAFE KNOWLEDGE` in `agent/prompt.py`.
 26. **The calculator's item set is only as good as the category the model picks.** *(Narrowed 2026-08-13: `item_name` is gone, so the model can no longer collapse a general request to one silently-priced item — see Calculator. What's left is the category choice itself, and note `CALC_NO_CATEGORY|` only catches names that don't **exist** — a valid-but-wrong category, "coffee" → `["Cold Drinks"]`, still produces a perfectly good card answering the wrong question. It is at least visible: every option is a real item at its real price, so the customer can see the list is wrong and say so. Closing it entirely needs intent→category mapping — a keyword column on `menu_items` is the obvious shape — which is the same class of problem as FAQ matching (gap #24). Not built: the failure is now cosmetic and self-correcting, and tagging would move the judgement rather than delete it.)* Prices and option lists are resolved server-side from `menu_items`, so neither can be wrong. What remains model-judgement is *which* categories a request maps to — "coffee for 40" → `["Hot Classics", "Premium Brews", "Specialty Lattes"]` is a semantic call. Far smaller surface than the original gap (one category name vs. 17 hand-written options with hand-written prices), and bounded — every option shown is a real item at its real price whatever it picks.
-27. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.
+27. **No admin surface for events or tickets, and no reconciliation** — same family as gaps #8/#11/#22. Events, tiers and prices are hand-edited rows; `send_events.py` is the only trigger for pushing a card outside chat. Nothing checks a ticket in at the door, nothing releases a reservation, and there is no refund or cancel path — a `tickets` row is permanent and the tier count never comes back. `CANCEL_WINDOW_MINUTES` has no equivalent here.
+28. **Tickets are free and unpaid** — no `payment_intents` row is created for a reservation, so a paid event has no money path even when `ONLINE_PAYMENTS_ENABLED` is turned back on. JNO-325 assumes the existing `payment` type is reused for this; wiring it is the natural next step. The same epic assumes a `reminder` type for event reminders, which this repo doesn't implement at all.
+29. **The event DSL defs are a second copy of a schema being written in parallel** — gap #4/#20 made concrete. JNO-334/335/336 author per-type `event.v1.json`/`ticket_request.v1.json` in the Jaeno repo while the defs used here live in this repo's monolithic `schema.json`. Nothing compares them, and the client's generated model is stricter (that's exactly how the `poll_results` "Unsupported" card happened). In particular, a Flutter-side rename of `tier_name` would make every tap answer "sold out" with nothing logged as wrong.
+30. **A hallucination self-reinforces through history** — a wrong answer written to `conversation_history` gets copied verbatim on the next similar question until it ages out of the 20-message cap. Same mechanism as the placeholder bug above, but with a false fact instead of a stub. There is no detection for this; it needs a manual history clear.

@@ -42,6 +42,10 @@ from db.terms import (
 from db.faqs import (
     init_faqs_schema, get_faqs, get_faq,
 )
+from db.events import (
+    init_events_schema, get_events, get_event, get_event_tiers,
+    reserve_tickets_if_available,
+)
 from db.orders import set_order_countdown_event
 
 
@@ -62,6 +66,7 @@ def init_db():
     init_checkout_state_schema(cur)
     init_agreements_schema(cur)
     init_faqs_schema(cur)
+    init_events_schema(cur)
 
     conn.commit()
     conn.close()

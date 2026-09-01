@@ -15,6 +15,8 @@ from agent.tools.faq.show_faq import show_faq
 from agent.tools.faq.show_faqs import show_faqs
 from agent.tools.calculator.send_calculator import send_calculator
 from agent.tools.menu.get_menu_prices import get_menu_prices
+from agent.tools.events.show_events import show_events
+from agent.tools.events.show_event import show_event
 
 
 
@@ -36,4 +38,6 @@ __all__ = [
     "show_faqs",
     "send_calculator",
     "get_menu_prices",
+    "show_events",
+    "show_event",
 ]

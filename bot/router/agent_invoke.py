@@ -38,7 +38,15 @@ async def _invoke_agent_with_retry(messages, sender: str, retries: int = 4):
     for attempt in range(retries + 1):
         result = await asyncio.wait_for(
             agent.ainvoke({"messages": messages}, context=Context(user_id=sender)),
-            timeout=50.0,
+            # A timeout throws away work the tools already did: the card is sent
+            # by _dispatch_agent_result from the *returned* result, so cancelling
+            # the final model call discards a calculator/poll payload that was
+            # already built. Budget for the longest path — the calculator is 4
+            # round trips (model → get_menu_prices → model → send_calculator →
+            # model) and blew 50s consistently on a free reasoning model.
+            # ponytail: one budget for every path; split per-path if a fast turn
+            # ever needs to fail sooner than this.
+            timeout=120.0,
         )
         if not _is_empty_agent_response(result):
             return result

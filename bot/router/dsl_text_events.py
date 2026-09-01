@@ -241,6 +241,38 @@ async def handle_dsl_text_event(dsl: dict, sender: str, room_id: str) -> tuple[b
             logger.info(f"🔨 Bid accepted | {auction_id} | {sender} | Rs {amount}")
         return True, None
 
+    # ── ticket_request — customer tapped "Get tickets" on an event card ──────
+    # Deterministic, no LLM: the `remaining` count and sold-out state on the
+    # card are cosmetic and stale, exactly like the auction card's min-bid, so
+    # reserve_tickets_if_available() re-decides it inside one locked
+    # transaction and its answer is the only one that counts.
+    if dsl_type == 'ticket_request':
+        from db import get_event, reserve_tickets_if_available
+        data = dsl.get('data', {})
+        tier_name = str(data.get('tier_name', '')).strip()
+        try:
+            quantity = int(data.get('quantity', 1))
+        except (TypeError, ValueError):
+            quantity = 0
+
+        event = get_event(data.get('event_id', ''))
+        if not event or quantity < 1:
+            await send_text(room_id, "❌ I couldn't find that event — say \"events\" to see what's on.")
+            return True, None
+
+        reference = reserve_tickets_if_available(event["id"], tier_name, quantity, sender)
+        if not reference:
+            await send_text(
+                room_id,
+                f"😔 Sorry — {tier_name or 'that'} tickets for {event['title']} are sold out. "
+                "Say \"events\" to see what else is on."
+            )
+            return True, None
+
+        from bot.events.event_service import send_ticket_confirmation_card
+        await send_ticket_confirmation_card(room_id, event, tier_name, quantity, reference)
+        return True, None
+
     # ── terms_response — customer agreed to / declined the order terms ───
     # Deterministic, no LLM: record the consent, then resume or cancel the
     # order that _send_final_confirm_poll() parked at 'awaiting_terms'.

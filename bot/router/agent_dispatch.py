@@ -69,6 +69,22 @@ def _is_history_placeholder(text: str) -> bool:
     return bool(_re.fullmatch(r'\[.*\bsent\b.*\]', text.strip(), _re.DOTALL))
 
 
+def _is_signal_noise(text: str) -> bool:
+    """True when the whole reply is a bare marker like "EVENTS_CARD".
+
+    The model coins these by analogy with the real ones it sees in the prompt —
+    MENU_CARD/ITEM_CARD are documented, so it invented EVENTS_CARD (seen live)
+    and will invent the next one too. Matching the *shape* (all-caps with an
+    underscore, nothing else) beats adding a .replace() per name every time,
+    which is what the ITEM_CARD note above ended up doing.
+
+    Same consequence as a bracketed placeholder if it gets through: it's shown
+    to the customer and written to history, where the model copies it back out.
+    """
+    t = text.strip().split("|")[0].strip()
+    return bool(t) and "_" in t and bool(_re.fullmatch(r'[A-Z0-9_]+', t))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT RESULT DISPATCH — parse signal strings out of the agent's messages,
 # send the matching DSL card/flow, and return cleaned reply text for history.
@@ -110,6 +126,9 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     triggered_rating_poll = None
     triggered_poll_history = False
     triggered_calculator = None
+    triggered_events = False
+    triggered_event = None
+    event_no_match = False
 
 
     all_content = [str(m.content) if hasattr(m, 'content') else str(m) for m in result.get('messages', [])]
@@ -165,6 +184,24 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
                 faq_match = _re.search(r'FAQ_TRIGGERED\|(.+)', msg_content)
                 if faq_match:
                     triggered_faq = faq_match.group(1).strip()
+                break
+
+    # ── EVENTS_TRIGGERED / EVENT_TRIGGERED|{title} — events + ticket cards ────
+    # No substring collision: "EVENT_TRIGGERED" is not inside "EVENTS_TRIGGERED".
+    if any("EVENTS_TRIGGERED" in c for c in all_content):
+        triggered_events = True
+    # show_event missed. Worth carrying into dispatch: the model answers a miss
+    # by falling back to the list, and a bare list card reads as an answer to
+    # "do you have X?" when it isn't one.
+    if any("EVENT_NO_MATCH" in c for c in all_content):
+        event_no_match = True
+    if isinstance(result, dict) and "messages" in result:
+        for msg in result["messages"]:
+            msg_content = msg.content if hasattr(msg, "content") else ""
+            if isinstance(msg_content, str) and "EVENT_TRIGGERED" in msg_content:
+                ev_match = _re.search(r'EVENT_TRIGGERED\|(.+)', msg_content)
+                if ev_match:
+                    triggered_event = ev_match.group(1).strip()
                 break
 
     # ── CALC_TRIGGERED|{json} — calculator card (JNO-237) ─────────────────────
@@ -353,8 +390,13 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     # show_faq's miss signal — the model is told to answer normally after one,
     # but it sometimes echoes the marker alongside its answer.
     reply = reply.replace("FAQ_NO_MATCH", "").strip()
+    reply = _re.sub(r'EVENT_TRIGGERED\|[^\n]+', '', reply).strip()
+    reply = reply.replace("EVENTS_TRIGGERED", "").strip()
+    # show_events/show_event miss signals — the model is told to recover from
+    # each, but sometimes echoes the marker alongside its answer.
+    reply = reply.replace("EVENTS_NONE", "").replace("EVENT_NO_MATCH", "").strip()
 
-    if _is_history_placeholder(reply):
+    if _is_history_placeholder(reply) or _is_signal_noise(reply):
         reply = ""
 
 
@@ -391,7 +433,7 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
     # harmless when the model repeats it verbatim.
 
     # ── Nothing triggered and no text — fall back to a generic apology ────────
-    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history and not triggered_faq and not triggered_faq_list and not triggered_calculator:
+    if not reply and not triggered_menu and not triggered_payment and not triggered_order_history and not triggered_item and not triggered_category and not triggered_poll and not triggered_multi_poll and not triggered_ranking_poll and not triggered_banner and not triggered_open_poll and not triggered_rating_poll and not triggered_poll_history and not triggered_faq and not triggered_faq_list and not triggered_calculator and not triggered_events and not triggered_event:
 
         reply = "I'm sorry, I didn't quite get that. Could you please repeat?"
 
@@ -423,6 +465,34 @@ async def _dispatch_agent_result(result, room_id: str, sender: str, fulfillment:
         else:
             await send_faq_card(room_id, get_faqs())
             clean_reply = "Here are the questions we get asked most — tap any one to see the answer."
+    elif triggered_events or triggered_event:
+        from db import get_events, get_event
+        from bot.events.event_service import send_events_card, send_event_detail_card
+        # Same clean_reply rule as the FAQ branch: whatever lands here is
+        # re-injected into history and copied back out by the model on the next
+        # similar question, so it has to be a sentence that's harmless repeated
+        # verbatim — never "" (that becomes the literal "Got it!") and never a
+        # bare title.
+        event = get_event(triggered_event) if triggered_event else None
+        if event:
+            if reply:
+                await send_text(room_id, reply)
+            await send_event_detail_card(room_id, event)
+            clean_reply = reply or f"Here are the ticket options for {event['title']}."
+        else:
+            # A miss has to be said out loud. The model often writes nothing at
+            # all (MiniMax emits the signal and no prose), so the "no" can't
+            # depend on it — otherwise "do you have a sourdough workshop?" is
+            # answered with a card of two unrelated events and no denial, which
+            # is gap #25 wearing a card.
+            lead = reply or (
+                "I don't have that one on the calendar — here's what we do have."
+                if event_no_match else ""
+            )
+            if lead:
+                await send_text(room_id, lead)
+            await send_events_card(room_id, get_events())
+            clean_reply = lead or "Here's what we've got coming up — tap any one for tickets."
     elif triggered_menu:
         await send_menu(room_id)
     elif triggered_payment:
